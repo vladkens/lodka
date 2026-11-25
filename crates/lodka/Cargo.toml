@@ -1,0 +1,10 @@
+[package]
+name = "lodka"
+description = "A small, fast Docker VM for Apple silicon Macs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
