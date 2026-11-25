@@ -8,3 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+block2 = "0.6"
+libc = "0.2.191"
+lodka-proto = { version = "0.1.0", path = "../lodka-proto" }
