@@ -2,6 +2,7 @@
 
 LINT := uv run --script https://raw.githubusercontent.com/vladkens/lint/main/rust.py
 CARGO_FLAGS := --release --locked
+GUEST := --target aarch64-unknown-linux-musl -p lodka-guest
 
 prepare:
 	cargo +nightly fmt
@@ -11,6 +12,7 @@ prepare:
 check:
 	cargo +nightly fmt --check
 	cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
+	cargo clippy $(CARGO_FLAGS) $(GUEST) -- -D warnings
 	$(LINT)
 
 test:
@@ -26,3 +28,18 @@ update:
 
 clean:
 	cargo clean
+
+.PHONY: guest kernel rootfs images
+
+# The guest's PID 1, static for Linux on arm64
+guest:
+	cargo build $(CARGO_FLAGS) $(GUEST)
+
+# guest/out/Image and guest/out/rootfs.img, built in a container on OrbStack or Colima
+kernel:
+	scripts/build-guest.sh kernel
+
+rootfs: guest
+	scripts/build-guest.sh rootfs
+
+images: kernel rootfs

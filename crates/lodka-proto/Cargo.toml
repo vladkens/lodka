@@ -1,0 +1,10 @@
+[package]
+name = "lodka-proto"
+description = "The wire between lodka on the Mac and its guest VM"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

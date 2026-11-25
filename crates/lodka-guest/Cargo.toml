@@ -1,0 +1,12 @@
+[package]
+name = "lodka-guest"
+description = "PID 1 of lodka's Linux VM: mounts, services and the link to the Mac"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2.191"
+lodka-proto = { version = "0.1.0", path = "../lodka-proto" }

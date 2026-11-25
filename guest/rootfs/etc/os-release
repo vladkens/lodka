@@ -1,0 +1,5 @@
+NAME="lodka"
+ID=lodka
+ID_LIKE=alpine
+PRETTY_NAME="lodka"
+HOME_URL="https://github.com/vladkens/lodka"
