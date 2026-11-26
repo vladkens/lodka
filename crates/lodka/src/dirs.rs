@@ -22,7 +22,7 @@ pub fn data_dir() -> PathBuf {
   xdg("XDG_DATA_HOME", ".local/share")
 }
 
-/// What the running VM writes: its console and its lock.
+/// What the running VM writes: its console, its lock and the Docker socket.
 pub fn state_dir() -> PathBuf {
   xdg("XDG_STATE_HOME", ".local/state")
 }
@@ -79,6 +79,10 @@ fn whole_file(kind: libc::c_short) -> libc::flock {
 
 pub fn console_file() -> PathBuf {
   state_dir().join("console.log")
+}
+
+pub fn docker_sock() -> PathBuf {
+  state_dir().join("docker.sock")
 }
 
 pub fn disk_file() -> PathBuf {
