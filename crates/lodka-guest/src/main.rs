@@ -22,6 +22,8 @@ const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 /// Set once the VM powers off: services that exit are no longer started again.
 pub static STOPPING: AtomicBool = AtomicBool::new(false);
+/// How long containers get to stop when the VM powers off; lodka waits a bit longer.
+const STOP_WAIT: Duration = Duration::from_secs(12);
 
 macro_rules! log {
   ($($arg:tt)*) => { eprintln!("lodka-guest: {}", format!($($arg)*)) };
@@ -36,10 +38,11 @@ fn main() {
 
   // SAFETY: setting the environment before any thread starts.
   unsafe { std::env::set_var("PATH", PATH) };
+  watch_signals();
   if let Err(e) = boot() {
     log!("boot failed: {e}");
     thread::sleep(Duration::from_secs(1));
-    sys::poweroff();
+    sys::poweroff(false);
   }
 
   for &(name, cmd, files) in SERVICES {
@@ -206,16 +209,21 @@ const SERVICES: &[(&str, &[&str], Option<u64>)] = &[
 fn start(name: &'static str, cmd: &[&str], files: Option<u64>) {
   let mut c = Command::new(cmd[0]);
   c.args(&cmd[1..]).stdin(Stdio::null());
-  if let Some(n) = files {
-    // SAFETY: setrlimit between fork and exec only touches the child.
-    unsafe {
-      c.pre_exec(move || {
+  // SAFETY: between fork and exec, calls that touch only the child: it gets no signals blocked
+  // (PID 1 blocks those it waits for, and a child keeps the mask) and its open files' limit.
+  unsafe {
+    c.pre_exec(move || {
+      let mut set: libc::sigset_t = std::mem::zeroed();
+      libc::sigemptyset(&mut set);
+      libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+      if let Some(n) = files {
         let lim = libc::rlimit { rlim_cur: n, rlim_max: n };
         libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-        Ok(())
-      })
-    };
-  }
+      }
+
+      Ok(())
+    })
+  };
 
   // Under the lock, so the reaper can't take the child for a stranger before it is listed, and
   // a shutdown, which sets STOPPING before it looks, sees every service started.
@@ -268,12 +276,36 @@ fn reap() -> ! {
   }
 }
 
-/// Stops every process, gives them `wait` to exit, then powers the VM off. dockerd goes first,
-/// alone: it stops the containers, then containerd and its shims, which outlive a SIGTERM of
-/// their own.
-pub fn shutdown(wait: Duration) -> ! {
+/// busybox's reboot, halt and poweroff ask init with SIGTERM, SIGUSR1 and SIGUSR2. Blocked here
+/// before any other thread starts, so in all of them: the kernel then queues them for PID 1,
+/// which it otherwise spares the signals it has no handler for.
+fn watch_signals() {
+  // SAFETY: plain signal set calls on a local set.
+  let set = unsafe {
+    let mut set: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut set);
+    for x in [libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2] {
+      libc::sigaddset(&mut set, x);
+    }
+
+    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    set
+  };
+
+  thread::spawn(move || {
+    let mut sig = 0;
+    // SAFETY: waits for one of the signals in `set`, blocked in every thread.
+    unsafe { libc::sigwait(&set, &mut sig) };
+    shutdown(sig == libc::SIGTERM);
+  });
+}
+
+/// Stops every process, gives them STOP_WAIT to exit, then powers the VM off or restarts it.
+/// dockerd goes first, alone: it stops the containers, then containerd and its shims, which
+/// outlive a SIGTERM of their own.
+pub fn shutdown(restart: bool) -> ! {
   STOPPING.store(true, Ordering::Release);
-  log!("powering off");
+  log!("{}", if restart { "rebooting" } else { "powering off" });
   let t0 = Instant::now();
   let running = |name| RUNNING.lock().unwrap().iter().find(|x| x.1 == name).map(|x| x.0);
   if let Some(pid) = running("dockerd") {
@@ -281,19 +313,19 @@ pub fn shutdown(wait: Duration) -> ! {
     unsafe { libc::kill(pid as i32, libc::SIGTERM) };
   }
 
-  while t0.elapsed() < wait && running("dockerd").is_some() {
+  while t0.elapsed() < STOP_WAIT && running("dockerd").is_some() {
     thread::sleep(Duration::from_millis(50));
   }
 
   // SAFETY: signals every process but PID 1.
   unsafe { libc::kill(-1, libc::SIGTERM) };
-  while t0.elapsed() < wait && !sys::others().is_empty() {
+  while t0.elapsed() < STOP_WAIT && !sys::others().is_empty() {
     thread::sleep(Duration::from_millis(50));
   }
 
   let left = sys::others();
   if !left.is_empty() {
-    log!("still running after {}s, killed: {}", wait.as_secs(), left.join(", "));
+    log!("still running after {}s, killed: {}", STOP_WAIT.as_secs(), left.join(", "));
   }
 
   // SAFETY: as above.
@@ -303,5 +335,5 @@ pub fn shutdown(wait: Duration) -> ! {
     log!("{e}");
   }
 
-  sys::poweroff()
+  sys::poweroff(restart)
 }

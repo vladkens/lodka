@@ -58,11 +58,13 @@ pub fn set_time(secs: u64, nanos: u32) -> io::Result<bool> {
   Ok(true)
 }
 
-pub fn poweroff() -> ! {
-  // SAFETY: flushes the file systems, then powers off (PSCI SYSTEM_OFF): the VM ends.
+/// Powers the VM off, or restarts it: PSCI SYSTEM_OFF or SYSTEM_RESET.
+pub fn poweroff(restart: bool) -> ! {
+  let how = if restart { libc::RB_AUTOBOOT } else { libc::RB_POWER_OFF };
+  // SAFETY: flushes the file systems, then ends the VM.
   unsafe {
     libc::sync();
-    libc::reboot(libc::RB_POWER_OFF);
+    libc::reboot(how);
   }
   std::process::exit(1)
 }

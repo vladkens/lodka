@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -29,6 +31,8 @@ use crate::vsock::{self, Connector, Listener, Vsock};
 const POWEROFF_WAIT: Duration = Duration::from_secs(15);
 /// How often the guest's clock is set from the Mac's; it stands still while the Mac sleeps.
 const TIME_EVERY: Duration = Duration::from_secs(30);
+/// The VM's lock, which a rebooted VM leaves open for the next one in its process.
+const LOCK_FD_VAR: &str = "LODKA_LOCK_FD";
 
 pub fn serve() -> io::Result<()> {
   let t0 = Instant::now();
@@ -111,13 +115,11 @@ pub fn serve() -> io::Result<()> {
   let stop = m.run()?;
   dirs::clear_state();
 
-  drop(lock);
   match stop {
     Stop::Poweroff => eprintln!("lodka: powered off"),
     Stop::Reboot => {
       eprintln!("lodka: rebooting");
-      let mut c = Command::new(env::current_exe()?);
-      c.arg("_vm").env_remove(dirs::SETTINGS_VAR).stdin(Stdio::null()).spawn()?;
+      return Err(reboot(&lock));
     }
     Stop::Error(e) => return Err(bad(e)),
   }
@@ -125,12 +127,35 @@ pub fn serve() -> io::Result<()> {
   Ok(())
 }
 
+/// Runs the next VM in this process with the lock kept open across exec, so it holds on: no
+/// `stop` or `delete` gets in between. Returns only when exec fails.
+fn reboot(lock: &File) -> io::Error {
+  let fd = lock.as_raw_fd();
+  // SAFETY: clears close-on-exec on a descriptor of ours.
+  if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+    return io::Error::last_os_error();
+  }
+
+  let exe = match env::current_exe() {
+    Ok(x) => x,
+    Err(e) => return e,
+  };
+
+  let mut c = Command::new(exe);
+  c.arg("_vm").env_remove(dirs::SETTINGS_VAR).env(LOCK_FD_VAR, fd.to_string()).exec()
+}
+
 // MARK: Files
 
 /// Takes the VM's lock, held as long as the process runs, and writes the pid into its file for
 /// people; lodka asks the lock.
 fn lock() -> io::Result<File> {
-  let mut f = dirs::lock()?.ok_or_else(|| bad("the VM runs already"))?;
+  let mut f = match env::var(LOCK_FD_VAR).ok().and_then(|x| x.parse().ok()) {
+    // SAFETY: the descriptor the VM before this one in the process left open, with its lock.
+    Some(fd) => unsafe { File::from_raw_fd(fd) },
+    None => dirs::lock()?.ok_or_else(|| bad("the VM runs already"))?,
+  };
+
   f.set_len(0)?;
   writeln!(f, "{}", std::process::id())?;
   Ok(f)

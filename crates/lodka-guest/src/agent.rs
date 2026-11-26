@@ -17,8 +17,6 @@ use crate::{log, shutdown, sys};
 
 const DOCKER_SOCK: &str = "/run/docker.sock";
 const AUTHORIZED_KEYS: &str = "/run/lodka/authorized_keys";
-/// How long containers get to stop when the VM powers off; lodka waits a bit longer.
-const STOP_WAIT: Duration = Duration::from_secs(12);
 /// The ports below aren't the containers': sshd's own.
 const OWN_PORTS: &[u16] = &[22];
 /// The ports are told again this often unchanged, so lodka tries again those it couldn't take.
@@ -97,7 +95,7 @@ fn serve(stream: UnixStream) -> io::Result<()> {
         std::fs::create_dir_all("/run/lodka")?;
         std::fs::write(AUTHORIZED_KEYS, format!("{key}\n"))?;
       }
-      Some(Ctl::Poweroff) => shutdown(STOP_WAIT),
+      Some(Ctl::Poweroff) => shutdown(false),
       _ => log!("control: unexpected {line:?}"),
     }
   }
