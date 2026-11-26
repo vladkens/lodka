@@ -10,6 +10,7 @@ use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, thread};
@@ -65,7 +66,7 @@ pub fn serve() -> io::Result<()> {
   let mac = net.mac.map(|x| format!("{x:02x}")).join(":");
   eprintln!("lodka: {} cpus, {} GiB memory, mac {mac}", s.cpus, s.memory);
 
-  let ctl = Arc::new(Control { out: Mutex::new(None), t0 });
+  let ctl = Arc::new(Control { cur: Mutex::default(), opened: AtomicU64::new(0), t0 });
   let mut listeners: HashMap<u32, Listener> = HashMap::new();
   let c = ctl.clone();
   listeners.insert(
@@ -173,23 +174,31 @@ fn docker(conn: Connector) -> io::Result<()> {
 // MARK: Control
 
 struct Control {
-  /// The guest's end of the current control connection, until a send to it fails.
-  out: Mutex<Option<UnixStream>>,
+  cur: Mutex<Current>,
+  /// How many connections the guest opened: each one's number, in the order it opened them.
+  opened: AtomicU64,
   t0: Instant,
+}
+
+/// The current control connection: its number, and the guest's end until a send to it fails.
+#[derive(Default)]
+struct Current {
+  id: u64,
+  out: Option<UnixStream>,
 }
 
 impl Control {
   /// Sends a line to the guest; false when no guest is connected. A guest that doesn't take it
   /// within SEND_WAIT loses the connection, half a line and all, and dials again.
   fn send(&self, msg: &Ctl) -> bool {
-    let mut out = self.out.lock().unwrap();
-    let Some(x) = out.as_mut() else { return false };
+    let mut cur = self.cur.lock().unwrap();
+    let Some(x) = cur.out.as_mut() else { return false };
     if writeln!(x, "{msg}").is_ok() {
       return true;
     }
 
     let _ = x.shutdown(Shutdown::Both);
-    *out = None;
+    cur.out = None;
     false
   }
 
@@ -197,21 +206,30 @@ impl Control {
   /// before is shut, which ends its thread: one is open at a time, however many the guest
   /// opens. The vsock device's thread calls this, so it never waits for the lock.
   fn attach(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
+    let id = self.opened.fetch_add(1, Ordering::Relaxed) + 1;
     let c = self.clone();
     thread::Builder::new().name("control".into()).spawn(move || {
-      if let Err(e) = c.serve(stream) {
+      if let Err(e) = c.serve(id, stream) {
         eprintln!("lodka: control: {e}");
       }
     })?;
     Ok(())
   }
 
-  fn serve(&self, stream: UnixStream) -> io::Result<()> {
+  fn serve(&self, id: u64, stream: UnixStream) -> io::Result<()> {
     let out = stream.try_clone()?;
     out.set_write_timeout(Some(SEND_WAIT))?;
-    if let Some(old) = self.out.lock().unwrap().replace(out) {
+    let mut cur = self.cur.lock().unwrap();
+    if id < cur.id {
+      return Ok(()); // a later one got here first; this one closes as it drops
+    }
+
+    if let Some(old) = cur.out.replace(out) {
       let _ = old.shutdown(Shutdown::Both);
     }
+
+    cur.id = id;
+    drop(cur);
 
     self.send(&Ctl::now());
 
