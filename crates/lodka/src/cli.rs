@@ -179,9 +179,20 @@ pub fn delete(force: bool) -> io::Result<()> {
     stop(false)?;
   }
 
-  // Under the VM's lock: a VM started now would run on a deleted disk. Only lodka's files: the
-  // folder may be the state's too.
-  let _lock = dirs::lock()?.ok_or_else(|| bad("delete: the VM started again"))?;
+  // Under the disk's lock, which a VM holds whatever its other folders: one started now would run
+  // on a deleted disk. Only lodka's files: the folder may be the state's too.
+  let disk = match File::open(dirs::disk_file()) {
+    Ok(x) => Some(x),
+    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+    Err(e) => return Err(e),
+  };
+
+  if let Some(f) = &disk
+    && !dirs::lock_disk(f)?
+  {
+    return Err(bad("delete: a VM uses the disk"));
+  }
+
   let key = dirs::key_file();
   for x in [dirs::disk_file(), key.with_extension("pub"), key] {
     match fs::remove_file(x) {

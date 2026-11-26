@@ -180,16 +180,16 @@ fn lock() -> io::Result<File> {
 fn disk(s: &Settings) -> io::Result<(File, bool)> {
   let path = dirs::disk_file();
   let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-  // SAFETY: flock on an open file.
-  if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-    let e = io::Error::last_os_error();
-    return Err(match e.raw_os_error() {
-      Some(libc::EWOULDBLOCK) => bad(format!("{}: another VM uses it", path.display())),
-      _ => e,
-    });
+  if !dirs::lock_disk(&f)? {
+    return Err(bad(format!("{}: another VM uses it", path.display())));
   }
 
+  // `lodka delete` may have removed the file between the open and the lock.
   let meta = f.metadata()?;
+  if fs::metadata(&path).map(|x| x.ino()).ok() != Some(meta.ino()) {
+    return Err(bad(format!("{}: deleted as the VM started", path.display())));
+  }
+
   let (have, want, blank) = (meta.len(), s.disk as u64 * GIB, meta.blocks() == 0);
   if have < want {
     f.set_len(want)?;

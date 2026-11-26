@@ -50,9 +50,9 @@ pub fn pid_file() -> PathBuf {
   state_dir().join("lodka.pid")
 }
 
-/// The VM's lock, a write lock on the pid file: the VM holds it while it runs, `lodka delete`
-/// while it deletes the disk; None when taken. The file stays (a lock is on a file, not a name),
-/// and the holder never opens it again: closing any descriptor of it drops the process's locks.
+/// The VM's lock, a write lock on the pid file: the VM holds it while it runs; None when taken. The
+/// file stays (a lock is on a file, not a name), and the holder never opens it again: closing any
+/// descriptor of it drops the process's locks.
 pub fn lock() -> io::Result<Option<File>> {
   mkdir(&state_dir())?;
   let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(pid_file())?;
@@ -80,6 +80,21 @@ pub fn running() -> Option<i32> {
   }
 
   (l.l_type != libc::F_UNLCK).then_some(l.l_pid)
+}
+
+/// The data disk's own lock, a flock: the VM holds it as long as it runs, whatever its other
+/// folders, and `lodka delete` while it deletes the disk; false when taken.
+pub fn lock_disk(f: &File) -> io::Result<bool> {
+  // SAFETY: flock on an open file.
+  if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+    return Ok(true);
+  }
+
+  let e = io::Error::last_os_error();
+  match e.raw_os_error() {
+    Some(libc::EWOULDBLOCK) => Ok(false),
+    _ => Err(e),
+  }
 }
 
 fn whole_file(kind: libc::c_short) -> libc::flock {
