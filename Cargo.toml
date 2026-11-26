@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/lodka", "crates/lodka-vmm"]
+members = ["crates/lodka", "crates/lodka-guest", "crates/lodka-vmm"]
+default-members = ["crates/lodka", "crates/lodka-vmm"]
 
 [workspace.package]
 version = "0.1.0"

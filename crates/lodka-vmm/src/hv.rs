@@ -60,11 +60,13 @@ unsafe extern "C" {
   fn hv_gic_config_set_distributor_base(config: *mut c_void, addr: u64) -> i32;
   fn hv_gic_config_set_redistributor_base(config: *mut c_void, addr: u64) -> i32;
   fn hv_gic_create(config: *mut c_void) -> i32;
+  fn hv_gic_set_spi(intid: u32, level: bool) -> i32;
   fn hv_gic_get_distributor_size(size: *mut usize) -> i32;
   fn hv_gic_get_distributor_base_alignment(align: *mut usize) -> i32;
   fn hv_gic_get_redistributor_size(size: *mut usize) -> i32;
   fn hv_gic_get_redistributor_region_size(size: *mut usize) -> i32;
   fn hv_gic_get_redistributor_base_alignment(align: *mut usize) -> i32;
+  fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> i32;
   fn hv_gic_set_redistributor_reg(vcpu: Vcpu, reg: u32, value: u64) -> i32;
   fn hv_gic_get_redistributor_reg(vcpu: Vcpu, reg: u32, value: *mut u64) -> i32;
 
@@ -128,6 +130,8 @@ pub struct Gic {
   /// The end of the redistributors' space for the most vCPUs the GIC supports (32 MiB on
   /// macOS 27): no other device may sit in it.
   pub end: u64,
+  /// The first SPI's interrupt id and how many there are.
+  pub spis: (u32, u32),
 }
 
 /// Creates the GIC with its distributor at `base` and the redistributors of `cpus` vCPUs after
@@ -147,6 +151,9 @@ pub fn gic_create(base: u64, cpus: usize) -> io::Result<Gic> {
 
   let dist = base.next_multiple_of(dist_align);
   let redist = (dist + dist_size).next_multiple_of(redist_align);
+  let (mut spi_base, mut spi_count) = (0, 0);
+  // SAFETY: the getter writes two u32s.
+  check(unsafe { hv_gic_get_spi_interrupt_range(&mut spi_base, &mut spi_count) }, "gic spis")?;
 
   // SAFETY: a config made here, released once the GIC exists.
   unsafe {
@@ -160,7 +167,16 @@ pub fn gic_create(base: u64, cpus: usize) -> io::Result<Gic> {
 
   let end = redist + region;
   let redist = (redist, redist_size * cpus as u64);
-  Ok(Gic { dist: (dist, dist_size), redist, end })
+  Ok(Gic { dist: (dist, dist_size), redist, end, spis: (spi_base, spi_count) })
+}
+
+/// Raises or lowers a shared interrupt line.
+pub fn gic_set_spi(intid: u32, level: bool) {
+  // SAFETY: an unknown intid only returns an error.
+  let ret = unsafe { hv_gic_set_spi(intid, level) };
+  if ret != 0 {
+    eprintln!("lodka: hv_gic_set_spi({intid}, {level}): error {:#x}", ret as u32);
+  }
 }
 
 // MARK: vCPU

@@ -1,0 +1,11 @@
+[package]
+name = "lodka-guest"
+description = "PID 1 of lodka's Linux VM: mounts and the data disk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2.191"

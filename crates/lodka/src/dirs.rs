@@ -2,6 +2,8 @@
 //! lodka's folders, by the XDG Base Directory spec, the files in them, and the VM's settings.
 
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
@@ -15,7 +17,12 @@ pub fn config_dir() -> PathBuf {
   xdg("XDG_CONFIG_HOME", ".config")
 }
 
-/// What the running VM writes: its console.
+/// The VM's disk.
+pub fn data_dir() -> PathBuf {
+  xdg("XDG_DATA_HOME", ".local/share")
+}
+
+/// What the running VM writes: its console and its lock.
 pub fn state_dir() -> PathBuf {
   xdg("XDG_STATE_HOME", ".local/state")
 }
@@ -39,12 +46,47 @@ pub fn mkdir(dir: &Path) -> io::Result<()> {
   fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
+pub fn pid_file() -> PathBuf {
+  state_dir().join("lodka.pid")
+}
+
+/// The VM's lock, a write lock on the pid file: the VM holds it while it runs; None when taken.
+/// The file stays (a lock is on a file, not a name), and the holder never opens it again:
+/// closing any descriptor of it drops the process's locks.
+pub fn lock() -> io::Result<Option<File>> {
+  mkdir(&state_dir())?;
+  let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(pid_file())?;
+  let l = whole_file(libc::F_WRLCK);
+  // SAFETY: fcntl on an open file with a lock description that outlives the call.
+  if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &l) } == 0 {
+    return Ok(Some(f));
+  }
+
+  let e = io::Error::last_os_error();
+  match e.raw_os_error() {
+    Some(libc::EAGAIN | libc::EACCES) => Ok(None),
+    _ => Err(e),
+  }
+}
+
+fn whole_file(kind: libc::c_short) -> libc::flock {
+  // SAFETY: a plain C struct, valid zeroed; a length of 0 locks to the end of the file.
+  let mut l: libc::flock = unsafe { std::mem::zeroed() };
+  l.l_type = kind;
+  l.l_whence = libc::SEEK_SET as libc::c_short;
+  l
+}
+
 pub fn console_file() -> PathBuf {
   state_dir().join("console.log")
 }
 
-/// The guest's kernel (`Image`): from $LODKA_GUEST, next to an installed binary
-/// (../share/lodka), or in a checkout (target/<profile>/../../guest/out).
+pub fn disk_file() -> PathBuf {
+  data_dir().join("data.img")
+}
+
+/// The guest's kernel (`Image`) and root file system (`rootfs.img`): from $LODKA_GUEST, next
+/// to an installed binary (../share/lodka), or in a checkout (target/<profile>/../../guest/out).
 pub fn guest_dir() -> io::Result<PathBuf> {
   if let Some(x) = env::var_os("LODKA_GUEST") {
     return Ok(PathBuf::from(x));
@@ -54,8 +96,10 @@ pub fn guest_dir() -> io::Result<PathBuf> {
   let bin = exe.parent().unwrap_or(Path::new("/"));
   [bin.join("../share/lodka"), bin.join("../../guest/out")]
     .into_iter()
-    .find(|x| x.join("Image").exists())
-    .ok_or_else(|| bad("no guest kernel (Image): build it with make kernel or set LODKA_GUEST"))
+    .find(|x| x.join("Image").exists() && x.join("rootfs.img").exists())
+    .ok_or_else(|| {
+      bad("no guest files (Image, rootfs.img): build them with make images or set LODKA_GUEST")
+    })
 }
 
 // MARK: Settings
@@ -65,6 +109,8 @@ pub struct Settings {
   pub cpus: u32,
   /// GiB
   pub memory: u32,
+  /// GiB, the most the data disk grows to; it takes only what the guest writes.
+  pub disk: u32,
 }
 
 impl Default for Settings {
@@ -72,7 +118,7 @@ impl Default for Settings {
   fn default() -> Settings {
     let cpus = sysctl_u64(c"hw.ncpu").unwrap_or(4) as u32;
     let memory = (sysctl_u64(c"hw.memsize").unwrap_or(8 * GIB) / GIB / 2).clamp(2, 8) as u32;
-    Settings { cpus, memory }
+    Settings { cpus, memory, disk: 64 }
   }
 }
 
@@ -102,6 +148,7 @@ impl Settings {
       match key.trim() {
         "cpus" => s.cpus = value,
         "memory" => s.memory = value,
+        "disk" => s.disk = value,
         x => return Err(bad(format!("lodka.conf: unknown setting {x}"))),
       }
     }
@@ -140,7 +187,7 @@ mod tests {
   #[test]
   fn settings() {
     let s = Settings::parse("# c\ncpus = 3\n\nmemory=6\n").unwrap();
-    assert_eq!((s.cpus, s.memory), (3, 6));
+    assert_eq!((s.cpus, s.memory, s.disk), (3, 6, 64));
     for x in ["cpus", "cpus = 0", "cpus = x", "swap = 1"] {
       assert!(Settings::parse(x).is_err(), "{x}");
     }

@@ -3,7 +3,10 @@
 //! kernel. It knows nothing of lodka's commands, files or settings; the `lodka` binary builds
 //! the VM from them.
 
+pub mod blk;
+pub mod console;
 mod fdt;
 mod hv;
 pub mod machine;
 mod mem;
+mod virtio;

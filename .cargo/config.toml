@@ -1,0 +1,3 @@
+# The guest binary is static musl, linked with Rust's own lld: no cross toolchain needed.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

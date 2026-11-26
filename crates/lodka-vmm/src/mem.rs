@@ -3,6 +3,7 @@
 //! loads and stores in their MMIO windows.
 
 use std::io;
+use std::sync::atomic::AtomicU16;
 
 /// A device the vCPUs reach through loads and stores in its MMIO window.
 pub trait Mmio: Send {
@@ -51,11 +52,45 @@ impl Mem {
     Ok(unsafe { self.ptr.add(off as usize) })
   }
 
+  pub fn read(&self, gpa: u64, buf: &mut [u8]) -> io::Result<()> {
+    let src = self.ptr(gpa, buf.len())?;
+    // SAFETY: both ranges are valid for buf.len() bytes and can't overlap.
+    unsafe { std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len()) };
+    Ok(())
+  }
+
   pub fn write(&self, gpa: u64, buf: &[u8]) -> io::Result<()> {
     let dst = self.ptr(gpa, buf.len())?;
-    // SAFETY: both ranges are valid for buf.len() bytes and can't overlap.
+    // SAFETY: as in `read`.
     unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
     Ok(())
+  }
+
+  pub fn read_u16(&self, gpa: u64) -> io::Result<u16> {
+    let mut buf = [0; 2];
+    self.read(gpa, &mut buf)?;
+    Ok(u16::from_le_bytes(buf))
+  }
+
+  pub fn read_u32(&self, gpa: u64) -> io::Result<u32> {
+    let mut buf = [0; 4];
+    self.read(gpa, &mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+  }
+
+  pub fn read_u64(&self, gpa: u64) -> io::Result<u64> {
+    let mut buf = [0; 8];
+    self.read(gpa, &mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+  }
+
+  pub fn atomic_u16(&self, gpa: u64) -> io::Result<&AtomicU16> {
+    if !gpa.is_multiple_of(2) {
+      return Err(io::Error::new(io::ErrorKind::InvalidInput, "unaligned ring index"));
+    }
+
+    // SAFETY: in bounds and aligned; AtomicU16 has u16's layout.
+    Ok(unsafe { &*self.ptr(gpa, 2)?.cast::<AtomicU16>() })
   }
 }
 
