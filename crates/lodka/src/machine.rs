@@ -155,6 +155,8 @@ impl Machine {
     // At the top of RAM, in a 2 MiB block of its own.
     let fdt_addr = RAM_BASE + self.cfg.memory - 0x20_0000;
     self.mem.write(fdt_addr, &fdt)?;
+    // The boot vCPU starts at the kernel's entry point with the device tree in x0.
+    self.cpus.state.lock().unwrap().starts[0] = Some((entry, fdt_addr));
 
     let ncpus = self.cfg.cpus;
     let me = Arc::new(self);
@@ -162,9 +164,8 @@ impl Machine {
     let threads = (0..ncpus)
       .map(|idx| {
         let (me, made) = (me.clone(), made.clone());
-        let boot = (idx == 0).then_some((entry, fdt_addr));
         thread::Builder::new().name(format!("vcpu{idx}")).spawn(move || {
-          if let Err(e) = me.cpu(idx, boot, &made) {
+          if let Err(e) = me.cpu(idx, &made) {
             me.cpus.stop(Stop::Error(format!("vcpu{idx}: {e}")));
           }
         })
@@ -291,17 +292,16 @@ impl Machine {
 
   /// A vCPU's thread. Every vCPU is made before any runs: the GIC takes its topology as final
   /// once one does.
-  fn cpu(&self, idx: usize, boot: Option<(u64, u64)>, made: &Barrier) -> io::Result<()> {
+  fn cpu(&self, idx: usize, made: &Barrier) -> io::Result<()> {
     let cpu = self.make_cpu(idx);
     made.wait();
     let cpu = cpu?;
 
-    let mut start = boot;
-    loop {
-      let Some((entry, x0)) = start.take().or_else(|| self.wait_start(idx)) else {
-        return Ok(());
-      };
-
+    // Every start is as from reset, with the MMU and caches off, a restart after CPU_OFF too:
+    // the entry point runs on physical addresses.
+    let sctlr = cpu.sys_reg(hv::SYS_SCTLR_EL1);
+    while let Some((entry, x0)) = self.wait_start(idx) {
+      cpu.set_sys_reg(hv::SYS_SCTLR_EL1, sctlr)?;
       cpu.set_reg(hv::REG_PC, entry);
       cpu.set_reg(hv::REG_X0, x0);
       for r in 1..4 {
@@ -309,12 +309,13 @@ impl Machine {
       }
 
       cpu.set_reg(hv::REG_CPSR, CPSR_EL1H_MASKED);
-      self.cpus.state.lock().unwrap().on[idx] = true;
       match self.run_cpu(&cpu)? {
         Next::Off => self.cpus.state.lock().unwrap().on[idx] = false,
         Next::Exit => return Ok(()),
       }
     }
+
+    Ok(())
   }
 
   fn make_cpu(&self, idx: usize) -> io::Result<hv::Cpu> {
@@ -327,7 +328,8 @@ impl Machine {
     Ok(cpu)
   }
 
-  /// Waits for a PSCI CPU_ON naming this vCPU; `None` once the VM stops.
+  /// Waits for a PSCI CPU_ON naming this vCPU (the boot vCPU's start is there already) and marks
+  /// it on; `None` once the VM stops.
   fn wait_start(&self, idx: usize) -> Option<(u64, u64)> {
     let mut st = self.cpus.state.lock().unwrap();
     loop {
@@ -336,6 +338,7 @@ impl Machine {
       }
 
       if let Some(x) = st.starts[idx].take() {
+        st.on[idx] = true;
         return Some(x);
       }
 
@@ -442,7 +445,7 @@ impl Machine {
     } else {
       region.dev.lock().unwrap().read(off, &mut buf[..len]);
       if rt != 31 {
-        cpu.set_reg(hv::REG_X0 + rt, u64::from_le_bytes(buf));
+        cpu.set_reg(hv::REG_X0 + rt, loaded(u64::from_le_bytes(buf), len, syndrome));
       }
     }
 
@@ -453,6 +456,8 @@ impl Machine {
   fn psci(&self, cpu: &hv::Cpu) -> io::Result<Option<Next>> {
     const NOT_SUPPORTED: u64 = -1i64 as u64;
     const INVALID_PARAMETERS: u64 = -2i64 as u64;
+    const ALREADY_ON: u64 = -4i64 as u64;
+    const ON_PENDING: u64 = -5i64 as u64;
 
     let ret = match cpu.reg(hv::REG_X0) as u32 {
       0x8400_0000 => 2,                          // PSCI_VERSION: 0.2
@@ -460,9 +465,12 @@ impl Machine {
       // CPU_ON
       0x8400_0003 | 0xc400_0003 => {
         let (entry, ctx) = (cpu.reg(hv::REG_X0 + 2), cpu.reg(hv::REG_X0 + 3));
+        let mut st = self.cpus.state.lock().unwrap();
         match self.cpu_index(cpu.reg(hv::REG_X0 + 1)) {
+          Some(i) if st.on[i] => ALREADY_ON,
+          Some(i) if st.starts[i].is_some() => ON_PENDING,
           Some(i) => {
-            self.cpus.state.lock().unwrap().starts[i] = Some((entry, ctx));
+            st.starts[i] = Some((entry, ctx));
             self.cpus.cond.notify_all();
             0
           }
@@ -546,6 +554,14 @@ fn mpidr(i: usize) -> u64 {
 
 fn advance(cpu: &hv::Cpu) {
   cpu.set_reg(hv::REG_PC, cpu.reg(hv::REG_PC) + 4);
+}
+
+/// The value an MMIO load of `len` bytes leaves in its register, by the data abort's syndrome:
+/// SSE extends its sign, and a W register (SF clear) has its top half zero.
+fn loaded(val: u64, len: usize, syndrome: u64) -> u64 {
+  let bits = 64 - 8 * len as u32;
+  let val = if syndrome & (1 << 21) != 0 { ((val << bits) as i64 >> bits) as u64 } else { val };
+  if syndrome & (1 << 15) == 0 { val & u32::MAX as u64 } else { val }
 }
 
 /// Whether the virtual timer still asks for its interrupt: enabled, not masked, condition met.
@@ -643,5 +659,16 @@ mod tests {
     let ids: Vec<u32> =
       (0..8).map(|i| primecell_id(0xfe0 + 4 * i, [0x11, 0x10, 0x34, 0])).collect();
     assert_eq!(ids, [0x11, 0x10, 0x34, 0, 0x0d, 0xf0, 0x05, 0xb1]);
+  }
+
+  #[test]
+  fn mmio_loads() {
+    const SSE: u64 = 1 << 21;
+    const SF: u64 = 1 << 15;
+    assert_eq!(loaded(0x90, 1, SF), 0x90); // LDRB
+    assert_eq!(loaded(0x90, 1, SSE | SF), -112i64 as u64); // LDRSB Xn
+    assert_eq!(loaded(0x90, 1, SSE), 0xffff_ff90); // LDRSB Wn
+    assert_eq!(loaded(0x8000_0000, 4, SSE | SF), 0xffff_ffff_8000_0000); // LDRSW
+    assert_eq!(loaded(u64::MAX, 8, SF), u64::MAX); // LDR Xn
   }
 }

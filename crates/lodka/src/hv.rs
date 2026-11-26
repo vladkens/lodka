@@ -36,6 +36,7 @@ pub const REG_CPSR: u32 = 34;
 // hv_sys_reg_t
 pub const SYS_MPIDR_EL1: u16 = 0xc005;
 pub const SYS_ID_AA64PFR1_EL1: u16 = 0xc021;
+pub const SYS_SCTLR_EL1: u16 = 0xc080;
 pub const SYS_CNTV_CTL_EL0: u16 = 0xdf19;
 pub const SYS_CNTV_CVAL_EL0: u16 = 0xdf1a;
 
