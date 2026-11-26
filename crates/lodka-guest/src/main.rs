@@ -103,7 +103,7 @@ fn var() -> io::Result<()> {
   symlink("/run/lock", "/var/lock")?;
 
   if !sys::is_ext4(DATA_DEV)? {
-    if !sys::is_blank(DATA_DEV)? {
+    if !blank_disk() {
       let msg = "the data disk has data but no ext4 file system; lodka delete makes a new disk";
       return Err(io::Error::other(msg));
     }
@@ -123,6 +123,13 @@ fn var() -> io::Result<()> {
   // root's home keeps what a person leaves there.
   fs::create_dir_all("/var/lib/lodka/root")?;
   mount("/var/lib/lodka/root", "/root", "", libc::MS_BIND, "")
+}
+
+/// Whether lodka says the data disk is blank, none of it on the Mac yet: a disk only gets a file
+/// system then, as one with a damaged file system may still hold data.
+fn blank_disk() -> bool {
+  let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+  cmdline.split_whitespace().any(|x| x == "lodka.blank")
 }
 
 /// Runs a command to its end; only while booting, before the reaper takes every exit.

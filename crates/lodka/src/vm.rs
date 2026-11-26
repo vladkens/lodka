@@ -5,6 +5,7 @@
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +21,7 @@ pub fn serve() -> io::Result<()> {
   mkdir(&dirs::data_dir())?;
   let s = Settings::load()?;
   let guest = dirs::guest_dir()?;
-  let disk = disk(&s)?;
+  let (disk, blank) = disk(&s)?;
   let console = Arc::new(Mutex::new(File::create(dirs::console_file())?));
 
   let mut cmdline =
@@ -28,6 +29,10 @@ pub fn serve() -> io::Result<()> {
   match env::var_os("LODKA_DEBUG") {
     Some(_) => cmdline += " earlycon=pl011,0x09000000 loglevel=7",
     None => cmdline += " quiet",
+  }
+
+  if blank {
+    cmdline += " lodka.blank";
   }
 
   let memory = s.memory as u64 * GIB;
@@ -67,11 +72,13 @@ fn lock() -> io::Result<File> {
 }
 
 /// The data disk, sparse: it takes on the Mac only what the guest writes. It grows when the
-/// setting does (the guest grows its file system at boot), never shrinks.
-fn disk(s: &Settings) -> io::Result<PathBuf> {
+/// setting does (the guest grows its file system at boot), never shrinks. Also returns whether
+/// it is blank, none of it on the Mac yet: only such a disk gets a file system.
+fn disk(s: &Settings) -> io::Result<(PathBuf, bool)> {
   let path = dirs::disk_file();
   let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-  let (have, want) = (f.metadata()?.len(), s.disk as u64 * GIB);
+  let meta = f.metadata()?;
+  let (have, want, blank) = (meta.len(), s.disk as u64 * GIB, meta.blocks() == 0);
   if have < want {
     f.set_len(want)?;
   } else if have > want {
@@ -82,5 +89,5 @@ fn disk(s: &Settings) -> io::Result<PathBuf> {
     );
   }
 
-  Ok(path)
+  Ok((path, blank))
 }
