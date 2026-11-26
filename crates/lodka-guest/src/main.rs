@@ -1,7 +1,7 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
 //! PID 1 of lodka's VM: mounts the file systems (a read-only erofs root, the data disk at
-//! /var/lib), starts the network and dockerd and keeps them running, reaps orphans, and talks
-//! to lodka on the Mac over vsock. Powers the VM off when lodka asks.
+//! /var/lib), starts the network, sshd and dockerd and keeps them running, reaps orphans, and
+//! talks to lodka on the Mac over vsock. Powers the VM off when lodka asks.
 
 mod agent;
 mod sys;
@@ -17,6 +17,7 @@ use std::{fs, io, thread};
 use sys::mount;
 
 const DATA_DEV: &str = "/dev/vdb";
+const HOST_KEY: &str = "/var/lib/lodka/ssh/ssh_host_ed25519_key";
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Set once the VM powers off: services that exit are no longer started again.
@@ -105,13 +106,15 @@ fn boot() -> io::Result<()> {
   }
 
   var()?;
+  host_key()?;
   run("ip", &["link", "set", "lo", "up"])?;
   run("ip", &["link", "set", "eth0", "up"])?;
   Ok(())
 }
 
 /// /var in memory, with the data disk at /var/lib: Docker's images, containers and volumes,
-/// and root's home. The disk gets a file system on first boot and grows with its device.
+/// the SSH host key and root's home. The disk gets a file system on first boot and grows with its
+/// device.
 fn var() -> io::Result<()> {
   mount("tmpfs", "/var", "tmpfs", NOSUID | NODEV, "mode=0755")?;
   for x in ["lib", "log", "cache", "spool", "empty"] {
@@ -154,6 +157,25 @@ fn blank_disk() -> bool {
   cmdline.split_whitespace().any(|x| x == "lodka.blank")
 }
 
+/// sshd's host key, made on the first boot and synced at once: a VM stopped before the guest
+/// wrote it back left it empty, and sshd down on every boot after.
+fn host_key() -> io::Result<()> {
+  if fs::metadata(HOST_KEY).is_ok_and(|x| x.len() > 0) {
+    return Ok(());
+  }
+
+  let public = format!("{HOST_KEY}.pub");
+  fs::create_dir_all("/var/lib/lodka/ssh")?;
+  let _ = fs::remove_file(HOST_KEY);
+  let _ = fs::remove_file(&public);
+  run("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-f", HOST_KEY])?;
+  for x in [HOST_KEY, &public] {
+    fs::File::open(x)?.sync_all()?;
+  }
+
+  Ok(())
+}
+
 /// Runs a command to its end; only while booting, before the reaper takes every exit.
 fn run(cmd: &str, args: &[&str]) -> io::Result<()> {
   let st = Command::new(cmd).args(args).stdin(Stdio::null()).status()?;
@@ -187,6 +209,7 @@ const SERVICES: &[(&str, &[&str], Option<u64>)] = &[
     &["udhcpc", "-f", "-i", "eth0", "-s", "/usr/lib/lodka/udhcpc.sh", "-x", "hostname:lodka"],
     None,
   ),
+  ("sshd", &["/usr/sbin/sshd", "-D", "-e"], None),
   ("dockerd", &["dockerd", "--log-level", "warn"], Some(1 << 20)),
 ];
 
