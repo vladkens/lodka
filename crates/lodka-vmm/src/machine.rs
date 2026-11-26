@@ -109,7 +109,7 @@ impl Cpus {
 // MARK: Machine
 
 pub struct Machine {
-  pub mem: Arc<Mem>,
+  mem: Arc<Mem>,
   cfg: Config,
   gic: hv::Gic,
   bus: Bus,
