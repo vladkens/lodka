@@ -1,11 +1,14 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
-//! The process that runs the VM (`lodka _vm`): boots the guest's kernel with its console in a
-//! log file and runs it until it powers off.
+//! The process that runs the VM (`lodka _vm`): makes the data disk on first use, boots the guest
+//! from its root file system with its console in a log file, and runs it until it powers off.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::{env, io};
 
+use lodka_vmm::blk::Blk;
+use lodka_vmm::console::{Console, Rng};
 use lodka_vmm::machine::{Config, Machine, Stop};
 
 use crate::bad;
@@ -13,20 +16,36 @@ use crate::dirs::{self, GIB, Settings, mkdir};
 
 pub fn serve() -> io::Result<()> {
   mkdir(&dirs::state_dir())?;
+  mkdir(&dirs::data_dir())?;
   let s = Settings::load()?;
   let guest = dirs::guest_dir()?;
+  let disk = disk(&s)?;
   let console = Arc::new(Mutex::new(File::create(dirs::console_file())?));
 
-  let mut cmdline = "console=ttyAMA0 panic=-1".to_string();
+  let mut cmdline =
+    "console=hvc0 root=/dev/vda ro rootfstype=erofs init=/sbin/lodka-guest panic=-1".to_string();
   match env::var_os("LODKA_DEBUG") {
     Some(_) => cmdline += " earlycon=pl011,0x09000000 loglevel=7",
     None => cmdline += " quiet",
   }
 
   let memory = s.memory as u64 * GIB;
-  let cfg = Config { cpus: s.cpus as usize, memory, kernel: guest.join("Image"), cmdline, console };
-  let m = Machine::new(cfg)?;
+  let cfg = Config {
+    cpus: s.cpus as usize,
+    memory,
+    kernel: guest.join("Image"),
+    cmdline,
+    console: console.clone(),
+  };
+  let mut m = Machine::new(cfg)?;
   eprintln!("lodka: {} cpus, {} GiB memory", s.cpus, s.memory);
+
+  // In this order the guest names them: hvc0, then /dev/vda (root) and /dev/vdb (data).
+  m.add(Box::new(Console::new(console)?));
+  m.add(Box::new(Rng::new()?));
+  let queues = s.cpus as usize;
+  m.add(Box::new(Blk::open(&guest.join("rootfs.img"), true, "lodka-root", 1)?));
+  m.add(Box::new(Blk::open(&disk, false, "lodka-data", queues)?));
 
   match m.run()? {
     Stop::Poweroff => eprintln!("lodka: powered off"),
@@ -35,4 +54,23 @@ pub fn serve() -> io::Result<()> {
   }
 
   Ok(())
+}
+
+/// The data disk, sparse: it takes on the Mac only what the guest writes. It grows when the
+/// setting does (the guest grows its file system at boot), never shrinks.
+fn disk(s: &Settings) -> io::Result<PathBuf> {
+  let path = dirs::disk_file();
+  let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+  let (have, want) = (f.metadata()?.len(), s.disk as u64 * GIB);
+  if have < want {
+    f.set_len(want)?;
+  } else if have > want {
+    eprintln!(
+      "lodka: the disk is {} GiB, more than the {} GiB set: disks don't shrink",
+      have / GIB,
+      s.disk
+    );
+  }
+
+  Ok(path)
 }

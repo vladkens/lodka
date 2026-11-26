@@ -15,6 +15,11 @@ pub fn config_dir() -> PathBuf {
   xdg("XDG_CONFIG_HOME", ".config")
 }
 
+/// The VM's disk.
+pub fn data_dir() -> PathBuf {
+  xdg("XDG_DATA_HOME", ".local/share")
+}
+
 /// What the running VM writes: its console.
 pub fn state_dir() -> PathBuf {
   xdg("XDG_STATE_HOME", ".local/state")
@@ -43,8 +48,12 @@ pub fn console_file() -> PathBuf {
   state_dir().join("console.log")
 }
 
-/// The guest's kernel (`Image`): from $LODKA_GUEST, next to an installed binary
-/// (../share/lodka), or in a checkout (target/<profile>/../../guest/out).
+pub fn disk_file() -> PathBuf {
+  data_dir().join("data.img")
+}
+
+/// The guest's kernel (`Image`) and root file system (`rootfs.img`): from $LODKA_GUEST, next
+/// to an installed binary (../share/lodka), or in a checkout (target/<profile>/../../guest/out).
 pub fn guest_dir() -> io::Result<PathBuf> {
   if let Some(x) = env::var_os("LODKA_GUEST") {
     return Ok(PathBuf::from(x));
@@ -54,8 +63,10 @@ pub fn guest_dir() -> io::Result<PathBuf> {
   let bin = exe.parent().unwrap_or(Path::new("/"));
   [bin.join("../share/lodka"), bin.join("../../guest/out")]
     .into_iter()
-    .find(|x| x.join("Image").exists())
-    .ok_or_else(|| bad("no guest kernel (Image): build it with make kernel or set LODKA_GUEST"))
+    .find(|x| x.join("Image").exists() && x.join("rootfs.img").exists())
+    .ok_or_else(|| {
+      bad("no guest files (Image, rootfs.img): build them with make images or set LODKA_GUEST")
+    })
 }
 
 // MARK: Settings
@@ -65,6 +76,8 @@ pub struct Settings {
   pub cpus: u32,
   /// GiB
   pub memory: u32,
+  /// GiB, the most the data disk grows to; it takes only what the guest writes.
+  pub disk: u32,
 }
 
 impl Default for Settings {
@@ -72,7 +85,7 @@ impl Default for Settings {
   fn default() -> Settings {
     let cpus = sysctl_u64(c"hw.ncpu").unwrap_or(4) as u32;
     let memory = (sysctl_u64(c"hw.memsize").unwrap_or(8 * GIB) / GIB / 2).clamp(2, 8) as u32;
-    Settings { cpus, memory }
+    Settings { cpus, memory, disk: 64 }
   }
 }
 
@@ -102,6 +115,7 @@ impl Settings {
       match key.trim() {
         "cpus" => s.cpus = value,
         "memory" => s.memory = value,
+        "disk" => s.disk = value,
         x => return Err(bad(format!("lodka.conf: unknown setting {x}"))),
       }
     }
@@ -140,7 +154,7 @@ mod tests {
   #[test]
   fn settings() {
     let s = Settings::parse("# c\ncpus = 3\n\nmemory=6\n").unwrap();
-    assert_eq!((s.cpus, s.memory), (3, 6));
+    assert_eq!((s.cpus, s.memory, s.disk), (3, 6, 64));
     for x in ["cpus", "cpus = 0", "cpus = x", "swap = 1"] {
       assert!(Settings::parse(x).is_err(), "{x}");
     }

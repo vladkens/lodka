@@ -14,13 +14,18 @@ use std::{fs, thread};
 use crate::fdt::Fdt;
 use crate::hv;
 use crate::mem::{Mem, Mmio};
+use crate::virtio::{Device, Irq, Kick, Transport};
 
 // Guest physical layout: the devices as QEMU's `virt` machine has them, the GIC after them, as
 // its redistributors' space is larger than `virt` leaves for it.
 const UART_BASE: u64 = 0x0900_0000;
 const RTC_BASE: u64 = 0x0901_0000;
+const VIRTIO_BASE: u64 = 0x0a00_0000;
+const VIRTIO_SIZE: u64 = 0x200;
 const GIC_BASE: u64 = 0x1000_0000;
 pub const RAM_BASE: u64 = 0x4000_0000;
+const _: () =
+  assert!(RTC_BASE + 0x1000 <= VIRTIO_BASE && VIRTIO_BASE + 64 * VIRTIO_SIZE <= GIC_BASE);
 
 const PHANDLE_GIC: u32 = 1;
 const PHANDLE_CLOCK: u32 = 2;
@@ -38,7 +43,7 @@ pub struct Config {
   pub memory: u64,
   pub kernel: PathBuf,
   pub cmdline: String,
-  /// Where the guest's console (PL011) writes.
+  /// Where the guest's early console (PL011) writes.
   pub console: Arc<Mutex<File>>,
 }
 
@@ -80,6 +85,8 @@ struct State {
   /// Where each vCPU starts, set by PSCI CPU_ON: entry point and its x0.
   starts: Vec<Option<(u64, u64)>>,
   on: Vec<bool>,
+  /// Bumped by every interrupt a device raises, so an idle vCPU knows to look.
+  generation: u64,
   stop: Option<Stop>,
 }
 
@@ -93,6 +100,13 @@ struct Cpus {
 }
 
 impl Cpus {
+  /// Always bumps `generation`: a vCPU that read it before entering the guest and then idles
+  /// must see the interrupt raised in between.
+  fn kick(&self) {
+    self.state.lock().unwrap().generation += 1;
+    self.cond.notify_all();
+  }
+
   fn stop(&self, why: Stop) {
     let mut st = self.state.lock().unwrap();
     if st.stop.is_none() {
@@ -114,6 +128,8 @@ pub struct Machine {
   gic: hv::Gic,
   bus: Bus,
   cpus: Arc<Cpus>,
+  /// Virtio devices: MMIO base and SPI intid.
+  virtio: Vec<(u64, u32)>,
 }
 
 impl Machine {
@@ -141,7 +157,23 @@ impl Machine {
     bus.add(UART_BASE, 0x1000, Uart { out: cfg.console.clone() });
     bus.add(RTC_BASE, 0x1000, Rtc::default());
 
-    Ok(Machine { mem, cfg, gic, bus, cpus })
+    Ok(Machine { mem, cfg, gic, bus, cpus, virtio: Vec::new() })
+  }
+
+  pub fn kick(&self) -> Kick {
+    let cpus = self.cpus.clone();
+    Arc::new(move || cpus.kick())
+  }
+
+  /// Adds a virtio device in the next MMIO slot, with the next free SPI.
+  pub fn add(&mut self, dev: Box<dyn Device>) {
+    let i = self.virtio.len() as u64;
+    let base = VIRTIO_BASE + i * VIRTIO_SIZE;
+    // SPIs 0-15 are left for the platform devices (UART 1, RTC 2)
+    let intid = self.gic.spis.0 + 16 + i as u32;
+    let irq = Irq::new(intid, self.kick());
+    self.bus.add(base, VIRTIO_SIZE, Transport::new(dev, self.mem.clone(), irq));
+    self.virtio.push((base, intid));
   }
 
   /// Loads the kernel and runs the VM until it powers off, reboots or fails.
@@ -206,6 +238,8 @@ impl Machine {
   }
 
   fn fdt(&self) -> Vec<u8> {
+    // The device tree numbers SPIs from 0; their interrupt ids start at 32.
+    let spi = |intid: u32| intid - 32;
     let mut f = Fdt::new();
     f.begin("");
     f.prop_str("compatible", "linux,dummy-virt");
@@ -284,6 +318,15 @@ impl Machine {
     f.prop_str("clock-names", "apb_pclk");
     f.end();
 
+    for &(base, intid) in &self.virtio {
+      f.begin(&format!("virtio_mmio@{base:x}"));
+      f.prop_str("compatible", "virtio,mmio");
+      f.prop_u64s("reg", &[base, VIRTIO_SIZE]);
+      f.prop_u32s("interrupts", &[SPI, spi(intid), LEVEL_HIGH]);
+      f.prop_null("dma-coherent");
+      f.end();
+    }
+
     f.end();
     f.finish()
   }
@@ -349,9 +392,14 @@ impl Machine {
   fn run_cpu(&self, cpu: &hv::Cpu) -> io::Result<Next> {
     let mut vtimer_masked = false;
     loop {
-      if self.cpus.state.lock().unwrap().stop.is_some() {
-        return Ok(Next::Exit);
-      }
+      let generation = {
+        let st = self.cpus.state.lock().unwrap();
+        if st.stop.is_some() {
+          return Ok(Next::Exit);
+        }
+
+        st.generation
+      };
 
       if vtimer_masked && !vtimer_asserted(cpu) {
         cpu.set_vtimer_mask(false);
@@ -378,7 +426,7 @@ impl Machine {
         0x01 => {
           advance(cpu);
           if syndrome & 1 == 0 {
-            self.wfi(cpu);
+            self.wfi(cpu, generation);
           }
         }
 
@@ -520,9 +568,9 @@ impl Machine {
     cpus_in(self.cfg.cpus, target, 0).first().copied()
   }
 
-  /// Idles a vCPU that ran WFI until an interrupt may be pending for it: its timer fires, or the
-  /// GIC has a private one (polled).
-  fn wfi(&self, cpu: &hv::Cpu) {
+  /// Idles a vCPU that ran WFI until an interrupt may be pending for it: a device raised one
+  /// (`generation` moved), its timer fires, or the GIC has a private one (polled).
+  fn wfi(&self, cpu: &hv::Cpu, generation: u64) {
     if cpu.gic_pending() != 0 {
       return;
     }
@@ -531,7 +579,7 @@ impl Machine {
     let cpus = &self.cpus;
     let mut st = cpus.state.lock().unwrap();
     loop {
-      if st.stop.is_some() {
+      if st.generation != generation || st.stop.is_some() {
         break;
       }
 
