@@ -113,8 +113,8 @@ fn boot() -> io::Result<()> {
 }
 
 /// /var in memory, with the data disk at /var/lib: Docker's images, containers and volumes,
-/// the SSH host key and root's home. The disk gets a file system on first boot and grows with its
-/// device.
+/// the SSH host key and root's home. The disk gets a file system on first boot and grows with
+/// its device.
 fn var() -> io::Result<()> {
   mount("tmpfs", "/var", "tmpfs", NOSUID | NODEV, "mode=0755")?;
   for x in ["lib", "log", "cache", "spool", "empty"] {
