@@ -1,12 +1,8 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
-//! lodka: a small, fast Docker VM for Apple silicon Macs. Its own VMM on Hypervisor.framework
-//! boots the guest's Linux kernel.
+//! lodka: a small, fast Docker VM for Apple silicon Macs. Its own VMM, `lodka-vmm`, boots the
+//! guest's Linux kernel on Hypervisor.framework.
 
 mod dirs;
-mod fdt;
-mod hv;
-mod machine;
-mod mem;
 mod vm;
 
 use std::io;

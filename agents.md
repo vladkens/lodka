@@ -14,9 +14,10 @@ the work under way `docs/plans/`.
 
 - Host: macOS 26+ on Apple silicon (Hypervisor.framework's in-kernel GICv3 needs macOS 15, a
   vmnet network without root needs 26). Guests are arm64 only.
-- Our own VMM, not Virtualization.framework: one process per VM (`lodka _vm`), one thread per
-  vCPU, virtio devices over MMIO, each on a thread of its own, moving data straight between guest
-  memory and the host (`preadv`/`pwritev`, `vmnet_read`/`vmnet_write`).
+- Our own VMM, not Virtualization.framework, in a crate of its own (`crates/lodka-vmm`) that
+  knows nothing of lodka's commands, files or settings: one process per VM (`lodka _vm`), one
+  thread per vCPU, virtio devices over MMIO, each on a thread of its own, moving data straight
+  between guest memory and the host (`preadv`/`pwritev`, `vmnet_read`/`vmnet_write`).
 - The guest: an `allnoconfig` kernel with what Docker needs built in, no modules; an erofs root
   from Alpine's packages, read-only; an ext4 data disk at `/var/lib`; `lodka-guest` as PID 1.
   Built in a container (`make images`), hosted by no one.

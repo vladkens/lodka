@@ -13,4 +13,12 @@ name = "lodka"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lodka-vmm",
+]
+
+[[package]]
+name = "lodka-vmm"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]

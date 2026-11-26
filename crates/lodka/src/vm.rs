@@ -6,9 +6,10 @@ use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::{env, io};
 
+use lodka_vmm::machine::{Config, Machine, Stop};
+
 use crate::bad;
 use crate::dirs::{self, GIB, Settings, mkdir};
-use crate::machine::{Config, Machine, Stop};
 
 pub fn serve() -> io::Result<()> {
   mkdir(&dirs::state_dir())?;
