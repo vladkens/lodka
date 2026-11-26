@@ -434,6 +434,12 @@ impl Mux {
         if let Some(c) = self.conns.get_mut(&key) {
           c.peer_done_recv |= h.flags & SHUT_RCV != 0;
           c.peer_done_send |= h.flags & SHUT_SEND != 0;
+          if c.peer_done_recv {
+            // The guest takes no more: what the host's side writes is dropped, not left to fill
+            // the socket's buffer until the writer blocks.
+            let _ = c.stream.shutdown(std::net::Shutdown::Read);
+          }
+
           if !c.flush() {
             self.reset(key);
           }
