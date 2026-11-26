@@ -211,7 +211,7 @@ fn request(mem: &Mem, chain: &Chain, disk: &Disk, kind: u32, off: u64) -> io::Re
       // struct virtio_blk_discard_write_zeroes: sector, num_sectors, flags
       let mut seg = [0u8; 16];
       chain.read_at(mem, 16, &mut seg)?;
-      let start = u64::from_le_bytes(seg[..8].try_into().unwrap()) * SECTOR;
+      let start = u64::from_le_bytes(seg[..8].try_into().unwrap()).saturating_mul(SECTOR);
       let len = u32::from_le_bytes(seg[8..12].try_into().unwrap()) as u64 * SECTOR;
       if start.checked_add(len).is_none_or(|x| x > disk.size) {
         return Ok((S_IOERR, 0));

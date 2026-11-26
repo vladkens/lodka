@@ -552,7 +552,12 @@ impl Mux {
   }
 
   fn fill_rx(&mut self) -> io::Result<()> {
+    // Data waits for the control packets made before it, a connection's response first.
     self.send_ctrl()?;
+    if !self.ctrl.is_empty() {
+      return Ok(());
+    }
+
     let keys: Vec<Key> = self.conns.iter().filter(|x| x.1.wants_read()).map(|x| *x.0).collect();
     for key in keys {
       while let Some(c) = self.conns.get(&key).filter(|x| x.wants_read()) {
