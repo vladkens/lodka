@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
@@ -62,13 +63,14 @@ pub fn serve() -> io::Result<()> {
   let mac = net.mac.map(|x| format!("{x:02x}")).join(":");
   eprintln!("lodka: {} cpus, {} GiB memory, mac {mac}", s.cpus, s.memory);
 
-  let (ctl_tx, ctl_rx) = mpsc::channel();
+  let ctl = Arc::new(Control { out: Mutex::new(None), t0 });
   let mut listeners: HashMap<u32, Listener> = HashMap::new();
+  let c = ctl.clone();
   listeners.insert(
     CONTROL_PORT,
     Box::new(move || {
       let (a, b) = vsock::pair()?;
-      ctl_tx.send(a).map_err(|_| bad("control channel closed"))?;
+      c.attach(a)?;
       Ok(b)
     }),
   );
@@ -84,10 +86,7 @@ pub fn serve() -> io::Result<()> {
   m.add(Box::new(net));
   m.add(Box::new(vsock));
 
-  let ctl = Arc::new(Control { out: Mutex::new(None), t0 });
   docker(conn)?;
-  let c = ctl.clone();
-  thread::Builder::new().name("control".into()).spawn(move || c.run(ctl_rx))?;
   let c = ctl.clone();
   thread::Builder::new().name("time".into()).spawn(move || {
     loop {
@@ -172,7 +171,8 @@ fn docker(conn: Connector) -> io::Result<()> {
 // MARK: Control
 
 struct Control {
-  /// The guest's end of the current control connection.
+  /// The guest's end of the current control connection. One the guest closed stays until the
+  /// next replaces it: sends to it fail.
   out: Mutex<Option<UnixStream>>,
   t0: Instant,
 }
@@ -187,19 +187,25 @@ impl Control {
     }
   }
 
-  /// Serves each control connection the guest opens, one at a time.
-  fn run(&self, conns: mpsc::Receiver<UnixStream>) {
-    for x in conns {
-      if let Err(e) = self.serve(x) {
+  /// Makes a connection the guest opens the current one and serves it on a thread of its own.
+  /// The one before is shut, which ends its thread: one connection is open at a time, however
+  /// many the guest opens.
+  fn attach(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
+    let out = stream.try_clone()?;
+    if let Some(old) = self.out.lock().unwrap().replace(out) {
+      let _ = old.shutdown(Shutdown::Both);
+    }
+
+    let c = self.clone();
+    thread::Builder::new().name("control".into()).spawn(move || {
+      if let Err(e) = c.serve(stream) {
         eprintln!("lodka: control: {e}");
       }
-
-      *self.out.lock().unwrap() = None;
-    }
+    })?;
+    Ok(())
   }
 
   fn serve(&self, stream: UnixStream) -> io::Result<()> {
-    *self.out.lock().unwrap() = Some(stream.try_clone()?);
     self.send(&Ctl::now());
 
     let secs = || self.t0.elapsed().as_secs_f32();
