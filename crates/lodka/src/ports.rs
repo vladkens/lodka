@@ -10,10 +10,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, Tc
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::{io, thread};
 
 /// Opens a stream to a TCP port in the guest.
 pub type Dial = Arc<dyn Fn(u16) -> io::Result<UnixStream> + Send + Sync>;
+
+/// How often a relay looks again at the Unix socket it reads: under load, macOS now and then
+/// doesn't wake a blocked reader when the other end writes or shuts down.
+const RECHECK: Duration = Duration::from_millis(250);
 
 /// Where each port listens on the Mac.
 const LOCAL: [IpAddr; 2] = [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
@@ -95,6 +100,7 @@ fn accept(l: TcpListener, port: u16, dial: &Dial, stop: &AtomicBool) {
 /// Copies between the two connections both ways until both are done.
 fn relay(a: TcpStream, b: UnixStream) {
   let _ = a.set_nodelay(true);
+  let _ = b.set_read_timeout(Some(RECHECK));
   let (Ok(a2), Ok(b2)) = (a.try_clone(), b.try_clone()) else { return };
   let one = thread::spawn(move || {
     let _ = copy(&mut &a, &mut &b2);
@@ -114,6 +120,7 @@ fn copy(from: &mut impl Read, to: &mut impl Write) -> io::Result<()> {
       Ok(0) => return Ok(()),
       Ok(n) => to.write_all(&buf[..n])?,
       Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+      Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // RECHECK's timeout
       Err(e) => return Err(e),
     }
   }
