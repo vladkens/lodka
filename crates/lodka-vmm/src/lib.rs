@@ -9,4 +9,6 @@ mod fdt;
 mod hv;
 pub mod machine;
 mod mem;
+pub mod net;
 mod virtio;
+pub mod vsock;

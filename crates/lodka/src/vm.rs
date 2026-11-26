@@ -1,22 +1,36 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
-//! The process that runs the VM (`lodka _vm`): makes the data disk on first use, boots the guest
-//! from its root file system with its console in a log file, and runs it until it powers off.
+//! The process that runs the VM (`lodka _vm`): makes the disk and the network on first use,
+//! boots the guest, serves Docker's socket and the control channel, and powers the guest off
+//! cleanly on SIGTERM.
 
-use std::env;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::sync::{Arc, Mutex};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+use std::{env, thread};
 
+use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT};
 use lodka_vmm::blk::Blk;
 use lodka_vmm::console::{Console, Rng};
-use lodka_vmm::machine::{Config, Machine, Stop};
+use lodka_vmm::machine::{Config, Machine, Stop, Stopper};
+use lodka_vmm::net::Net;
+use lodka_vmm::vsock::{self, Connector, Listener, Vsock};
 
 use crate::bad;
 use crate::dirs::{self, GIB, Settings, mkdir};
 
+/// How long the guest gets to power off after SIGTERM before the VM is stopped.
+const POWEROFF_WAIT: Duration = Duration::from_secs(15);
+/// How often the guest's clock is set from the Mac's; it stands still while the Mac sleeps.
+const TIME_EVERY: Duration = Duration::from_secs(30);
+
 pub fn serve() -> io::Result<()> {
+  let t0 = Instant::now();
+  let signals = block_signals();
   let _lock = lock()?;
   mkdir(&dirs::data_dir())?;
   let s = Settings::load()?;
@@ -44,16 +58,49 @@ pub fn serve() -> io::Result<()> {
     console: console.clone(),
   };
   let mut m = Machine::new(cfg)?;
-  eprintln!("lodka: {} cpus, {} GiB memory", s.cpus, s.memory);
+  let net = Net::start()?;
+  let mac = net.mac.map(|x| format!("{x:02x}")).join(":");
+  eprintln!("lodka: {} cpus, {} GiB memory, mac {mac}", s.cpus, s.memory);
 
+  let (ctl_tx, ctl_rx) = mpsc::channel();
+  let mut listeners: HashMap<u32, Listener> = HashMap::new();
+  listeners.insert(
+    CONTROL_PORT,
+    Box::new(move || {
+      let (a, b) = vsock::pair()?;
+      ctl_tx.send(a).map_err(|_| bad("control channel closed"))?;
+      Ok(b)
+    }),
+  );
+
+  let vsock = Vsock::new(listeners)?;
+  let conn = vsock.connector();
   // In this order the guest names them: hvc0, then /dev/vda (root) and /dev/vdb (data).
   m.add(Box::new(Console::new(console)?));
   m.add(Box::new(Rng::new()?));
   let queues = s.cpus as usize;
   m.add(Box::new(Blk::new(File::open(guest.join("rootfs.img"))?, true, "lodka-root", 1)?));
   m.add(Box::new(Blk::new(disk, false, "lodka-data", queues)?));
+  m.add(Box::new(net));
+  m.add(Box::new(vsock));
 
-  match m.run()? {
+  let ctl = Arc::new(Control { out: Mutex::new(None), t0 });
+  docker(conn)?;
+  let c = ctl.clone();
+  thread::Builder::new().name("control".into()).spawn(move || c.run(ctl_rx))?;
+  let c = ctl.clone();
+  thread::Builder::new().name("time".into()).spawn(move || {
+    loop {
+      thread::sleep(TIME_EVERY);
+      c.send(&Ctl::now());
+    }
+  })?;
+  watch_signals(signals, ctl, m.stopper())?;
+
+  let stop = m.run()?;
+  let _ = fs::remove_file(dirs::docker_sock());
+
+  match stop {
     Stop::Poweroff => eprintln!("lodka: powered off"),
     Stop::Reboot => eprintln!("lodka: the guest restarted, stopped"),
     Stop::Error(e) => return Err(bad(e)),
@@ -61,6 +108,8 @@ pub fn serve() -> io::Result<()> {
 
   Ok(())
 }
+
+// MARK: Files
 
 /// Takes the VM's lock, held as long as the process runs: one VM on the disk at a time. The pid
 /// goes into its file for people.
@@ -99,4 +148,117 @@ fn disk(s: &Settings) -> io::Result<(File, bool)> {
   }
 
   Ok((f, blank))
+}
+
+// MARK: Docker
+
+/// Docker's socket on the Mac: each connection goes to dockerd's socket in the guest.
+fn docker(conn: Connector) -> io::Result<()> {
+  let path = dirs::docker_sock();
+  let _ = fs::remove_file(&path);
+  let l = UnixListener::bind(&path)?;
+  thread::Builder::new().name("docker".into()).spawn(move || {
+    for x in l.incoming() {
+      match x {
+        Ok(x) => conn.connect(DOCKER_PORT, x),
+        Err(e) => eprintln!("lodka: docker socket: {e}"),
+      }
+    }
+  })?;
+
+  Ok(())
+}
+
+// MARK: Control
+
+struct Control {
+  /// The guest's end of the current control connection.
+  out: Mutex<Option<UnixStream>>,
+  t0: Instant,
+}
+
+impl Control {
+  /// Sends a line to the guest; false when no guest is connected.
+  fn send(&self, msg: &Ctl) -> bool {
+    let mut out = self.out.lock().unwrap();
+    match out.as_mut() {
+      Some(x) => writeln!(x, "{msg}").is_ok(),
+      None => false,
+    }
+  }
+
+  /// Serves each control connection the guest opens, one at a time.
+  fn run(&self, conns: mpsc::Receiver<UnixStream>) {
+    for x in conns {
+      if let Err(e) = self.serve(x) {
+        eprintln!("lodka: control: {e}");
+      }
+
+      *self.out.lock().unwrap() = None;
+    }
+  }
+
+  fn serve(&self, stream: UnixStream) -> io::Result<()> {
+    *self.out.lock().unwrap() = Some(stream.try_clone()?);
+    self.send(&Ctl::now());
+
+    let secs = || self.t0.elapsed().as_secs_f32();
+    for line in BufReader::new(stream).lines() {
+      let line = line?;
+      match Ctl::parse(&line) {
+        Some(Ctl::Hello { version }) => eprintln!("lodka: guest {version} up in {:.2}s", secs()),
+        Some(Ctl::Addr(ip)) => eprintln!("lodka: guest address {ip}"),
+        Some(Ctl::Docker) => eprintln!("lodka: docker up in {:.2}s", secs()),
+        _ => eprintln!("lodka: control: unexpected {line:?}"),
+      }
+    }
+
+    Ok(())
+  }
+}
+
+// MARK: Signals
+
+/// Blocks the signals that stop the VM in every thread made after it, so `watch_signals` gets
+/// them all.
+fn block_signals() -> libc::sigset_t {
+  // SAFETY: plain signal set calls on a local set.
+  unsafe {
+    let mut set: libc::sigset_t = std::mem::zeroed();
+    libc::sigemptyset(&mut set);
+    for x in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+      libc::sigaddset(&mut set, x);
+    }
+
+    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    set
+  }
+}
+
+/// The first signal asks the guest to power off and stops the VM if it hasn't in a while; a
+/// second one stops it at once.
+fn watch_signals(set: libc::sigset_t, ctl: Arc<Control>, stopper: Stopper) -> io::Result<()> {
+  let run = move || {
+    let mut asked = false;
+    loop {
+      let mut sig = 0;
+      // SAFETY: waits for one of the signals in `set`, blocked in every thread.
+      unsafe { libc::sigwait(&set, &mut sig) };
+      if asked || !ctl.send(&Ctl::Poweroff) {
+        stopper.stop(Stop::Poweroff);
+        continue;
+      }
+
+      asked = true;
+      let stopper = stopper.clone();
+      thread::spawn(move || {
+        thread::sleep(POWEROFF_WAIT);
+        eprintln!("lodka: the guest did not power off, stopping it");
+        stopper.stop(Stop::Poweroff);
+      });
+    }
+  };
+
+  thread::Builder::new().name("signals".into()).spawn(run)?;
+  Ok(())
 }

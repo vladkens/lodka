@@ -120,6 +120,16 @@ impl Cpus {
   }
 }
 
+/// Stops a running machine from another thread.
+#[derive(Clone)]
+pub struct Stopper(Arc<Cpus>);
+
+impl Stopper {
+  pub fn stop(&self, why: Stop) {
+    self.0.stop(why);
+  }
+}
+
 // MARK: Machine
 
 pub struct Machine {
@@ -163,6 +173,10 @@ impl Machine {
   pub fn kick(&self) -> Kick {
     let cpus = self.cpus.clone();
     Arc::new(move || cpus.kick())
+  }
+
+  pub fn stopper(&self) -> Stopper {
+    Stopper(self.cpus.clone())
   }
 
   /// Adds a virtio device in the next MMIO slot, with the next free SPI.
