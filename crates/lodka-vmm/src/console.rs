@@ -32,6 +32,7 @@ impl Device for Console {
   fn activate(&mut self, mem: Arc<Mem>, queues: Vec<Queue>, irq: Irq) -> io::Result<()> {
     let mut tx = queues[1].clone();
     let out = self.out.clone();
+    let mut failing = false;
     worker("console", self.wake.clone(), move || {
       let mut buf = vec![0u8; 64 * 1024];
       while let Some(chain) = tx.pop(&mem)? {
@@ -43,7 +44,17 @@ impl Device for Console {
             break;
           }
 
-          out.lock().unwrap().write_all(&buf[..n])?;
+          // The guest waits for each buffer back, so a write that fails (a full disk) drops
+          // the output rather than stalling the guest.
+          match out.lock().unwrap().write_all(&buf[..n]) {
+            Ok(()) => failing = false,
+            Err(e) if !failing => {
+              failing = true;
+              eprintln!("lodka: console: {e}; the guest's output is dropped while writes fail");
+            }
+            Err(_) => {}
+          }
+
           at += n;
         }
 
