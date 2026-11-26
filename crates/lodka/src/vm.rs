@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -34,11 +33,10 @@ const TIME_EVERY: Duration = Duration::from_secs(30);
 pub fn serve() -> io::Result<()> {
   let t0 = Instant::now();
   let signals = block_signals();
-  mkdir(&dirs::state_dir())?;
-  mkdir(&dirs::data_dir())?;
   let lock = lock()?;
   // A VM that didn't stop cleanly left its address behind; this one gets a new network.
   dirs::clear_state();
+  mkdir(&dirs::data_dir())?;
 
   let s = Settings::load()?;
   let guest = dirs::guest_dir()?;
@@ -119,15 +117,10 @@ pub fn serve() -> io::Result<()> {
 
 // MARK: Files
 
-/// Takes the VM's lock (held as long as the process runs) and writes the pid into it.
+/// Takes the VM's lock, held as long as the process runs, and writes the pid into its file for
+/// people; lodka asks the lock.
 fn lock() -> io::Result<File> {
-  let mut f =
-    OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dirs::pid_file())?;
-  // SAFETY: flock on an open file.
-  if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-    return Err(bad("the VM runs already"));
-  }
-
+  let mut f = dirs::lock()?.ok_or_else(|| bad("the VM runs already"))?;
   f.set_len(0)?;
   writeln!(f, "{}", std::process::id())?;
   Ok(f)

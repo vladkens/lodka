@@ -15,11 +15,14 @@ use std::{io, thread};
 /// Opens a stream to a TCP port in the guest.
 pub type Dial = Arc<dyn Fn(u16) -> io::Result<UnixStream> + Send + Sync>;
 
+/// Where each port listens on the Mac.
+const LOCAL: [IpAddr; 2] = [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
+
 pub struct Ports {
   dial: Dial,
-  open: HashMap<u16, Fwd>,
+  open: HashMap<SocketAddr, Fwd>,
   /// Those that couldn't be listened on, logged once.
-  failed: HashSet<u16>,
+  failed: HashSet<SocketAddr>,
 }
 
 impl Ports {
@@ -30,61 +33,47 @@ impl Ports {
   /// The ports the guest listens on now. The guest tells them again every few seconds, so a port
   /// taken on the Mac gets its listener once it is free.
   pub fn update(&mut self, ports: &[u16]) {
-    self.open.retain(|port, _| ports.contains(port));
-    self.failed.retain(|port| ports.contains(port));
-    for &port in ports {
-      if self.open.contains_key(&port) {
+    self.open.retain(|x, _| ports.contains(&x.port()));
+    self.failed.retain(|x| ports.contains(&x.port()));
+    for addr in ports.iter().flat_map(|&port| LOCAL.map(|ip| SocketAddr::new(ip, port))) {
+      if self.open.contains_key(&addr) {
         continue;
       }
 
-      match Fwd::open(port, &self.dial) {
+      match Fwd::open(addr, &self.dial) {
         Ok(x) => {
-          self.failed.remove(&port);
-          self.open.insert(port, x);
+          self.failed.remove(&addr);
+          self.open.insert(addr, x);
         }
-        Err(e) if self.failed.insert(port) => eprintln!("lodka: port {port}: {e}"),
+        Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => {} // a Mac without IPv6
+        Err(e) if self.failed.insert(addr) => eprintln!("lodka: port {addr}: {e}"),
         Err(_) => {}
       }
     }
   }
 }
 
-/// One port's listeners; dropping it closes them.
+/// One address's listener; dropping it closes it.
 struct Fwd {
   stop: Arc<AtomicBool>,
-  local: Vec<SocketAddr>,
+  addr: SocketAddr,
 }
 
 impl Fwd {
-  fn open(port: u16, dial: &Dial) -> io::Result<Fwd> {
+  fn open(addr: SocketAddr, dial: &Dial) -> io::Result<Fwd> {
+    let l = TcpListener::bind(addr)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let mut local = Vec::new();
-    // IPv4 must work; IPv6 when the Mac has it.
-    for (ip, need) in
-      [(IpAddr::V4(Ipv4Addr::LOCALHOST), true), (IpAddr::V6(Ipv6Addr::LOCALHOST), false)]
-    {
-      let l = match TcpListener::bind(SocketAddr::new(ip, port)) {
-        Ok(x) => x,
-        Err(e) if need => return Err(e),
-        Err(_) => continue,
-      };
-
-      local.push(l.local_addr()?);
-      let (stop, dial) = (stop.clone(), dial.clone());
-      let run = move || accept(l, port, &dial, &stop);
-      thread::Builder::new().name(format!("port-{port}")).spawn(run)?;
-    }
-
-    Ok(Fwd { stop, local })
+    let (port, dial, s) = (addr.port(), dial.clone(), stop.clone());
+    let run = move || accept(l, port, &dial, &s);
+    thread::Builder::new().name(format!("port-{port}")).spawn(run)?;
+    Ok(Fwd { stop, addr })
   }
 }
 
 impl Drop for Fwd {
   fn drop(&mut self) {
     self.stop.store(true, Ordering::Release);
-    for x in &self.local {
-      let _ = TcpStream::connect(x); // wakes `accept`, which sees `stop`
-    }
+    let _ = TcpStream::connect(self.addr); // wakes `accept`, which sees `stop`
   }
 }
 
@@ -160,5 +149,20 @@ mod tests {
     ports.update(&[]);
     thread::sleep(std::time::Duration::from_millis(50));
     assert!(TcpListener::bind(("127.0.0.1", free)).is_ok());
+  }
+
+  #[test]
+  fn retries_a_taken_address() {
+    let dial: Dial = Arc::new(|_| Ok(UnixStream::pair()?.0));
+    let taken = TcpListener::bind("[::1]:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut ports = Ports::new(dial);
+    ports.update(&[port]);
+    assert_eq!(ports.open.len(), 1);
+
+    drop(taken);
+    ports.update(&[port]);
+    assert_eq!(ports.open.len(), 2);
+    assert!(ports.failed.is_empty());
   }
 }

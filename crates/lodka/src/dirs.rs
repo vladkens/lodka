@@ -2,6 +2,8 @@
 //! lodka's folders, by the XDG Base Directory spec, the files in them, and the VM's settings.
 
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs, io};
@@ -46,6 +48,46 @@ pub fn mkdir(dir: &Path) -> io::Result<()> {
 
 pub fn pid_file() -> PathBuf {
   state_dir().join("lodka.pid")
+}
+
+/// The VM's lock, a write lock on the pid file: the VM holds it while it runs, `lodka delete`
+/// while it deletes the disk; None when taken. The file stays (a lock is on a file, not a name),
+/// and the holder never opens it again: closing any descriptor of it drops the process's locks.
+pub fn lock() -> io::Result<Option<File>> {
+  mkdir(&state_dir())?;
+  let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(pid_file())?;
+  let l = whole_file(libc::F_WRLCK);
+  // SAFETY: fcntl on an open file with a lock description that outlives the call.
+  if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &l) } == 0 {
+    return Ok(Some(f));
+  }
+
+  let e = io::Error::last_os_error();
+  match e.raw_os_error() {
+    Some(libc::EAGAIN | libc::EACCES) => Ok(None),
+    _ => Err(e),
+  }
+}
+
+/// The pid of the process that holds the VM's lock, asked of the kernel: the pid file's text
+/// is stale for a moment while a new VM takes the lock.
+pub fn running() -> Option<i32> {
+  let f = File::open(pid_file()).ok()?;
+  let mut l = whole_file(libc::F_WRLCK);
+  // SAFETY: as in `lock`; F_GETLK fills in `l`.
+  if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } != 0 {
+    return None;
+  }
+
+  (l.l_type != libc::F_UNLCK).then_some(l.l_pid)
+}
+
+fn whole_file(kind: libc::c_short) -> libc::flock {
+  // SAFETY: a plain C struct, valid zeroed; a length of 0 locks to the end of the file.
+  let mut l: libc::flock = unsafe { std::mem::zeroed() };
+  l.l_type = kind;
+  l.l_whence = libc::SEEK_SET as libc::c_short;
+  l
 }
 
 pub fn log_file() -> PathBuf {

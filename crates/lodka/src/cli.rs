@@ -2,9 +2,8 @@
 //! The commands a person runs: start, stop, status, ssh, delete. The VM runs in its own process
 //! (`lodka _vm`), which holds a lock on its pid file as long as it runs.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -14,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bad;
-use crate::dirs::{self, GIB, Settings, mkdir};
+use crate::dirs::{self, GIB, Settings, mkdir, running};
 
 const START_WAIT: Duration = Duration::from_secs(120);
 const STOP_WAIT: Duration = Duration::from_secs(30);
@@ -180,6 +179,8 @@ pub fn delete(force: bool) -> io::Result<()> {
     stop(false)?;
   }
 
+  // Under the VM's lock: a VM started now would run on a deleted disk.
+  let _lock = dirs::lock()?.ok_or_else(|| bad("delete: the VM started again"))?;
   match fs::remove_dir_all(dirs::data_dir()) {
     Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
     _ => {}
@@ -232,19 +233,6 @@ fn signed() -> io::Result<PathBuf> {
   fs::rename(&copy, &exe)?;
   eprintln!("lodka: signed {} with the hypervisor and virtualization entitlements", exe.display());
   Ok(exe)
-}
-
-/// The VM's pid when its process runs: it holds the lock on the pid file.
-fn running() -> Option<i32> {
-  let mut f = OpenOptions::new().read(true).open(dirs::pid_file()).ok()?;
-  // SAFETY: flock on an open file; a shared lock we get is released when `f` closes.
-  if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-    return None;
-  }
-
-  let mut pid = String::new();
-  f.read_to_string(&mut pid).ok()?;
-  pid.trim().parse().ok()
 }
 
 /// Whether Docker answers on its socket on the Mac.
