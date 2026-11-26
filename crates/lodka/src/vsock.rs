@@ -473,6 +473,12 @@ impl Mux {
     }
 
     if done < len {
+      // Past the credit lodka gives: a guest that ignored it would grow `out` without bound.
+      if c.out.len() + len - done > BUF_ALLOC as usize {
+        self.reset(key);
+        return Ok(());
+      }
+
       let at = c.out.len();
       c.out.resize(at + len - done, 0);
       chain.read_at(&self.mem, HDR + done, &mut c.out[at..])?;

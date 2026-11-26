@@ -33,11 +33,20 @@ impl Device for Console {
     let mut tx = queues[1].clone();
     let out = self.out.clone();
     worker("console", self.wake.clone(), move || {
-      let mut buf = Vec::new();
+      let mut buf = vec![0u8; 64 * 1024];
       while let Some(chain) = tx.pop(&mem)? {
-        buf.resize(chain.read_len(), 0);
-        chain.read_at(&mem, 0, &mut buf)?;
-        out.lock().unwrap().write_all(&buf)?;
+        // In pieces: the guest says how long its buffers are, up to 4 GiB each.
+        let mut at = 0;
+        loop {
+          let n = chain.read_at(&mem, at, &mut buf)?;
+          if n == 0 {
+            break;
+          }
+
+          out.lock().unwrap().write_all(&buf[..n])?;
+          at += n;
+        }
+
         tx.push(&mem, chain.head, 0)?;
         irq.used();
       }

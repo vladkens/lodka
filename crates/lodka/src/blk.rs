@@ -36,21 +36,27 @@ const SEG_MAX: u32 = 126;
 const HOLE: u64 = 4096;
 
 pub struct Blk {
-  file: Arc<File>,
-  ro: bool,
-  size: u64,
-  id: String,
+  disk: Arc<Disk>,
   /// One per queue.
   wakes: Vec<Arc<Wake>>,
+}
+
+/// What every queue's thread serves.
+struct Disk {
+  file: File,
+  ro: bool,
+  /// Bytes, whole sectors: requests past it fail.
+  size: u64,
+  id: String,
 }
 
 impl Blk {
   pub fn open(path: &Path, ro: bool, id: &str, queues: usize) -> io::Result<Blk> {
     let file = OpenOptions::new().read(true).write(!ro).open(path)?;
-    let size = file.metadata()?.len();
-    let (file, id) = (Arc::new(file), id.to_string());
+    let size = file.metadata()?.len() / SECTOR * SECTOR;
+    let disk = Arc::new(Disk { file, ro, size, id: id.to_string() });
     let wakes = (0..queues.max(1)).map(|_| Wake::new().map(Arc::new)).collect::<io::Result<_>>()?;
-    Ok(Blk { file, ro, size, id, wakes })
+    Ok(Blk { disk, wakes })
   }
 }
 
@@ -60,7 +66,7 @@ impl Device for Blk {
   }
 
   fn features(&self) -> u64 {
-    let rw = if self.ro { F_RO } else { F_DISCARD };
+    let rw = if self.disk.ro { F_RO } else { F_DISCARD };
     F_SEG_MAX | F_BLK_SIZE | F_FLUSH | F_MQ | rw
   }
 
@@ -71,7 +77,7 @@ impl Device for Blk {
   /// struct virtio_blk_config, up to the discard fields.
   fn config(&self) -> Vec<u8> {
     let mut c = vec![0u8; 48];
-    c[0..8].copy_from_slice(&(self.size / SECTOR).to_le_bytes());
+    c[0..8].copy_from_slice(&(self.disk.size / SECTOR).to_le_bytes());
     c[12..16].copy_from_slice(&SEG_MAX.to_le_bytes());
     c[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
     c[34..36].copy_from_slice(&(self.wakes.len() as u16).to_le_bytes()); // num_queues
@@ -83,10 +89,9 @@ impl Device for Blk {
 
   fn activate(&mut self, mem: Arc<Mem>, queues: Vec<Queue>, irq: Irq) -> io::Result<()> {
     for (i, mut q) in queues.into_iter().enumerate() {
-      let (mem, irq, file, ro, id) =
-        (mem.clone(), irq.clone(), self.file.clone(), self.ro, self.id.clone());
-      worker(&format!("blk-{id}-{i}"), self.wakes[i].clone(), move || {
-        let used = drain(&mut q, &mem, &file, ro, &id)?;
+      let (mem, irq, disk) = (mem.clone(), irq.clone(), self.disk.clone());
+      worker(&format!("blk-{}-{i}", disk.id), self.wakes[i].clone(), move || {
+        let used = drain(&mut q, &mem, &disk)?;
         if used && q.wants_irq(&mem) {
           irq.used();
         }
@@ -106,12 +111,12 @@ impl Device for Blk {
 }
 
 /// Serves the queue until it is empty; returns whether it used any buffers.
-fn drain(q: &mut Queue, mem: &Mem, file: &File, ro: bool, id: &str) -> io::Result<bool> {
+fn drain(q: &mut Queue, mem: &Mem, disk: &Disk) -> io::Result<bool> {
   let mut used = false;
   loop {
     q.set_notify(mem, false)?;
     while let Some(chain) = q.pop(mem)? {
-      let len = serve(mem, &chain, file, ro, id);
+      let len = serve(mem, &chain, disk);
       q.push(mem, chain.head, len)?;
       used = true;
     }
@@ -124,7 +129,7 @@ fn drain(q: &mut Queue, mem: &Mem, file: &File, ro: bool, id: &str) -> io::Resul
 }
 
 /// Serves one request; returns how many bytes it wrote into the chain (data and status).
-fn serve(mem: &Mem, chain: &Chain, file: &File, ro: bool, id: &str) -> u32 {
+fn serve(mem: &Mem, chain: &Chain, disk: &Disk) -> u32 {
   let wlen = chain.write_len();
   if wlen == 0 {
     return 0;
@@ -134,11 +139,11 @@ fn serve(mem: &Mem, chain: &Chain, file: &File, ro: bool, id: &str) -> u32 {
   let (status, data) = match chain.read_at(mem, 0, &mut hdr) {
     Ok(16) => {
       let kind = u32::from_le_bytes(hdr[..4].try_into().unwrap());
-      let off = u64::from_le_bytes(hdr[8..].try_into().unwrap()) * SECTOR;
-      match request(mem, chain, file, ro, id, kind, off) {
+      let off = u64::from_le_bytes(hdr[8..].try_into().unwrap()).saturating_mul(SECTOR);
+      match request(mem, chain, disk, kind, off) {
         Ok(x) => x,
         Err(e) => {
-          eprintln!("lodka: blk-{id}: {e}");
+          eprintln!("lodka: blk-{}: {e}", disk.id);
           (S_IOERR, 0)
         }
       }
@@ -150,17 +155,11 @@ fn serve(mem: &Mem, chain: &Chain, file: &File, ro: bool, id: &str) -> u32 {
   (data + 1) as u32
 }
 
-fn request(
-  mem: &Mem,
-  chain: &Chain,
-  file: &File,
-  ro: bool,
-  id: &str,
-  kind: u32,
-  off: u64,
-) -> io::Result<(u8, usize)> {
-  let fd = file.as_raw_fd();
+fn request(mem: &Mem, chain: &Chain, disk: &Disk, kind: u32, off: u64) -> io::Result<(u8, usize)> {
+  let fd = disk.file.as_raw_fd();
+  let inside = |len: usize| off.checked_add(len as u64).is_some_and(|x| x <= disk.size);
   let rep = match kind {
+    T_IN if !inside(chain.write_len() - 1) => (S_IOERR, 0),
     T_IN => {
       let len = chain.write_len() - 1;
       let iov = chain.iovecs(mem, true, 0, len)?;
@@ -170,16 +169,13 @@ fn request(
         return Err(io::Error::last_os_error());
       }
 
-      // Past the end of the file (its last sector, when its size isn't a whole number of them)
-      // reads as zeroes.
-      let n = n as usize;
-      if n < len {
-        chain.write_at(mem, n, &vec![0u8; len - n])?;
+      if (n as usize) < len {
+        return Err(io::Error::other(format!("read {n} of {len} bytes at {off}")));
       }
 
       (S_OK, len)
     }
-    T_OUT if ro => (S_IOERR, 0),
+    T_OUT if disk.ro || !inside(chain.read_len() - 16) => (S_IOERR, 0),
     T_OUT => {
       let len = chain.read_len() - 16;
       let iov = chain.iovecs(mem, false, 16, len)?;
@@ -207,17 +203,21 @@ fn request(
     }
     T_GET_ID => {
       let mut buf = [0u8; 20];
-      let n = id.len().min(20);
-      buf[..n].copy_from_slice(&id.as_bytes()[..n]);
+      let n = disk.id.len().min(20);
+      buf[..n].copy_from_slice(&disk.id.as_bytes()[..n]);
       (S_OK, chain.write_at(mem, 0, &buf)?)
     }
-    T_DISCARD if !ro => {
+    T_DISCARD if !disk.ro => {
       // struct virtio_blk_discard_write_zeroes: sector, num_sectors, flags
       let mut seg = [0u8; 16];
       chain.read_at(mem, 16, &mut seg)?;
       let start = u64::from_le_bytes(seg[..8].try_into().unwrap()) * SECTOR;
       let len = u32::from_le_bytes(seg[8..12].try_into().unwrap()) as u64 * SECTOR;
-      punch(file, start, len)?;
+      if start.checked_add(len).is_none_or(|x| x > disk.size) {
+        return Ok((S_IOERR, 0));
+      }
+
+      punch(&disk.file, start, len)?;
       (S_OK, 0)
     }
     _ => (S_UNSUPP, 0),
