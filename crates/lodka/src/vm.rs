@@ -28,6 +28,8 @@ use crate::dirs::{self, GIB, Settings, mkdir};
 const POWEROFF_WAIT: Duration = Duration::from_secs(15);
 /// How often the guest's clock is set from the Mac's; it stands still while the Mac sleeps.
 const TIME_EVERY: Duration = Duration::from_secs(30);
+/// How long a control line may wait for the guest to take it.
+const SEND_WAIT: Duration = Duration::from_secs(1);
 
 pub fn serve() -> io::Result<()> {
   let t0 = Instant::now();
@@ -171,31 +173,30 @@ fn docker(conn: Connector) -> io::Result<()> {
 // MARK: Control
 
 struct Control {
-  /// The guest's end of the current control connection. One the guest closed stays until the
-  /// next replaces it: sends to it fail.
+  /// The guest's end of the current control connection, until a send to it fails.
   out: Mutex<Option<UnixStream>>,
   t0: Instant,
 }
 
 impl Control {
-  /// Sends a line to the guest; false when no guest is connected.
+  /// Sends a line to the guest; false when no guest is connected. A guest that doesn't take it
+  /// within SEND_WAIT loses the connection, half a line and all, and dials again.
   fn send(&self, msg: &Ctl) -> bool {
     let mut out = self.out.lock().unwrap();
-    match out.as_mut() {
-      Some(x) => writeln!(x, "{msg}").is_ok(),
-      None => false,
+    let Some(x) = out.as_mut() else { return false };
+    if writeln!(x, "{msg}").is_ok() {
+      return true;
     }
+
+    let _ = x.shutdown(Shutdown::Both);
+    *out = None;
+    false
   }
 
-  /// Makes a connection the guest opens the current one and serves it on a thread of its own.
-  /// The one before is shut, which ends its thread: one connection is open at a time, however
-  /// many the guest opens.
+  /// Serves a connection the guest opens on a thread of its own, as the current one. The one
+  /// before is shut, which ends its thread: one is open at a time, however many the guest
+  /// opens. The vsock device's thread calls this, so it never waits for the lock.
   fn attach(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
-    let out = stream.try_clone()?;
-    if let Some(old) = self.out.lock().unwrap().replace(out) {
-      let _ = old.shutdown(Shutdown::Both);
-    }
-
     let c = self.clone();
     thread::Builder::new().name("control".into()).spawn(move || {
       if let Err(e) = c.serve(stream) {
@@ -206,6 +207,12 @@ impl Control {
   }
 
   fn serve(&self, stream: UnixStream) -> io::Result<()> {
+    let out = stream.try_clone()?;
+    out.set_write_timeout(Some(SEND_WAIT))?;
+    if let Some(old) = self.out.lock().unwrap().replace(out) {
+      let _ = old.shutdown(Shutdown::Both);
+    }
+
     self.send(&Ctl::now());
 
     let secs = || self.t0.elapsed().as_secs_f32();
