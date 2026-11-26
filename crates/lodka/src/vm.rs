@@ -5,8 +5,8 @@
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use lodka_vmm::blk::Blk;
@@ -50,8 +50,8 @@ pub fn serve() -> io::Result<()> {
   m.add(Box::new(Console::new(console)?));
   m.add(Box::new(Rng::new()?));
   let queues = s.cpus as usize;
-  m.add(Box::new(Blk::open(&guest.join("rootfs.img"), true, "lodka-root", 1)?));
-  m.add(Box::new(Blk::open(&disk, false, "lodka-data", queues)?));
+  m.add(Box::new(Blk::new(File::open(guest.join("rootfs.img"))?, true, "lodka-root", 1)?));
+  m.add(Box::new(Blk::new(disk, false, "lodka-data", queues)?));
 
   match m.run()? {
     Stop::Poweroff => eprintln!("lodka: powered off"),
@@ -71,12 +71,21 @@ fn lock() -> io::Result<File> {
   Ok(f)
 }
 
-/// The data disk, sparse: it takes on the Mac only what the guest writes. It grows when the
-/// setting does (the guest grows its file system at boot), never shrinks. Also returns whether
-/// it is blank, none of it on the Mac yet: only such a disk gets a file system.
-fn disk(s: &Settings) -> io::Result<(PathBuf, bool)> {
+/// The data disk, sparse: it takes on the Mac only what the guest writes, and grows with the
+/// setting, never shrinks. A flock keeps it this VM's alone, whatever folders another VM has.
+/// Also returns whether it is blank: none of it on the Mac yet.
+fn disk(s: &Settings) -> io::Result<(File, bool)> {
   let path = dirs::disk_file();
   let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+  // SAFETY: flock on an open file.
+  if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let e = io::Error::last_os_error();
+    return Err(match e.raw_os_error() {
+      Some(libc::EWOULDBLOCK) => bad(format!("{}: another VM uses it", path.display())),
+      _ => e,
+    });
+  }
+
   let meta = f.metadata()?;
   let (have, want, blank) = (meta.len(), s.disk as u64 * GIB, meta.blocks() == 0);
   if have < want {
@@ -89,5 +98,5 @@ fn disk(s: &Settings) -> io::Result<(PathBuf, bool)> {
     );
   }
 
-  Ok((path, blank))
+  Ok((f, blank))
 }

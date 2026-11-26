@@ -4,10 +4,9 @@
 //! vCPU, each served on a thread of its own; a discard punches a hole, so space Docker frees in
 //! the guest goes back to the Mac.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::mem::Mem;
@@ -51,8 +50,7 @@ struct Disk {
 }
 
 impl Blk {
-  pub fn open(path: &Path, ro: bool, id: &str, queues: usize) -> io::Result<Blk> {
-    let file = OpenOptions::new().read(true).write(!ro).open(path)?;
+  pub fn new(file: File, ro: bool, id: &str, queues: usize) -> io::Result<Blk> {
     let size = file.metadata()?.len() / SECTOR * SECTOR;
     let disk = Arc::new(Disk { file, ro, size, id: id.to_string() });
     let wakes = (0..queues.max(1)).map(|_| Wake::new().map(Arc::new)).collect::<io::Result<_>>()?;
