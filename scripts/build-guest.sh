@@ -1,24 +1,27 @@
 #!/bin/sh
-# Builds the guest into guest/out/: `kernel` (Image). Runs itself in an Alpine container on a
-# Docker that mounts the Mac's folders (OrbStack, Colima; not lodka yet). Kernel sources stay in
-# the `lodka-build` volume.
+# Builds the guest into guest/out/: `kernel` (Image), `rootfs` (rootfs.img, erofs) or `all`.
+# Runs itself in an Alpine container on a Docker that mounts the Mac's folders (OrbStack, Colima;
+# not lodka yet); `rootfs` needs the guest binary built first (`make guest`). Kernel sources stay
+# in the `lodka-build` volume.
 set -eu
 KVER=${KVER:-6.18.65}
 ALPINE=${ALPINE:-3.24}
 IMAGE=${IMAGE:-mirror.gcr.io/library/alpine:$ALPINE}
+GUEST_BIN=target/aarch64-unknown-linux-musl/release/lodka-guest
 
 if [ "${1:-}" != --inside ]; then
-  what=${1:-kernel}
-  case $what in kernel) ;; *) echo "usage: $0 kernel" >&2 && exit 2 ;; esac
+  what=${1:-all}
+  case $what in kernel | rootfs | all) ;; *) echo "usage: $0 kernel|rootfs|all" >&2 && exit 2 ;; esac
   cd "$(dirname "$0")/.."
+  [ "$what" = kernel ] || [ -x "$GUEST_BIN" ] || { echo "$GUEST_BIN missing: run make guest" >&2 && exit 1; }
   mkdir -p guest/out
   exec docker run --rm --platform linux/arm64 -v "$PWD:/src" -v lodka-build:/build \
-    -e KVER="$KVER" "$IMAGE" sh /src/scripts/build-guest.sh --inside "$what"
+    -e KVER="$KVER" -e GUEST_BIN="$GUEST_BIN" "$IMAGE" sh /src/scripts/build-guest.sh --inside "$what"
 fi
 
 what=$2
 apk add -q --no-cache build-base linux-headers bc flex bison perl openssl-dev elfutils-dev xz \
-  diffutils findutils curl
+  diffutils findutils erofs-utils curl
 
 kernel() {
   cd /build
@@ -36,6 +39,23 @@ kernel() {
   ls -l /src/guest/out/Image
 }
 
+rootfs() {
+  root=/tmp/rootfs
+  rm -rf $root && mkdir -p $root/etc/apk
+  cp -a /etc/apk/keys /etc/apk/repositories $root/etc/apk/
+  apk add -q --root $root --initdb --no-cache alpine-baselayout busybox musl e2fsprogs
+  rm -rf $root/var/cache/apk $root/etc/apk
+  cp -a /src/guest/rootfs/. $root/
+  install -s -m 755 "/src/$GUEST_BIN" $root/sbin/lodka-guest
+  # Mount points: the Mac's folders, Rosetta; /var is a tmpfs with the data disk at /var/lib
+  mkdir -p $root/Users $root/Volumes $root/private $root/mnt/rosetta
+  rm -rf $root/var/* $root/var/.[!.]*
+  mkfs.erofs -zlz4hc,12 -T0 --all-root /src/guest/out/rootfs.img $root
+  ls -l /src/guest/out/rootfs.img
+}
+
 case $what in
   kernel) kernel ;;
+  rootfs) rootfs ;;
+  all) kernel; rootfs ;;
 esac

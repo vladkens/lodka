@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lodka-guest"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "lodka-vmm"
 version = "0.1.0"
 dependencies = [
