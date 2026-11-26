@@ -43,9 +43,10 @@ rootfs() {
   root=/tmp/rootfs
   rm -rf $root && mkdir -p $root/etc/apk
   cp -a /etc/apk/keys /etc/apk/repositories $root/etc/apk/
-  # docker-engine brings containerd, runc and tini; busybox has udhcpc, ip and mount
+  # docker-engine brings containerd, runc and tini; busybox has udhcpc, ip and mount; git is
+  # for BuildKit's Git sources (`docker build <repo>.git`)
   apk add -q --root $root --initdb --no-cache alpine-baselayout busybox musl ca-certificates \
-    docker-engine e2fsprogs iptables ip6tables
+    docker-engine e2fsprogs git iptables ip6tables
   rm -rf $root/var/cache/apk $root/etc/apk
   cp -a /src/guest/rootfs/. $root/
   install -s -m 755 "/src/$GUEST_BIN" $root/sbin/lodka-guest
