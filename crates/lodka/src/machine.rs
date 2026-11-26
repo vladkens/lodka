@@ -465,16 +465,18 @@ impl Machine {
       // CPU_ON
       0x8400_0003 | 0xc400_0003 => {
         let (entry, ctx) = (cpu.reg(hv::REG_X0 + 2), cpu.reg(hv::REG_X0 + 3));
+        let ram = RAM_BASE..RAM_BASE + self.cfg.memory;
         let mut st = self.cpus.state.lock().unwrap();
         match self.cpu_index(cpu.reg(hv::REG_X0 + 1)) {
           Some(i) if st.on[i] => ALREADY_ON,
           Some(i) if st.starts[i].is_some() => ON_PENDING,
-          Some(i) => {
+          Some(i) if ram.contains(&entry) => {
             st.starts[i] = Some((entry, ctx));
             self.cpus.cond.notify_all();
             0
           }
-          None => INVALID_PARAMETERS,
+          // No such vCPU, or an entry point outside RAM
+          _ => INVALID_PARAMETERS,
         }
       }
 
