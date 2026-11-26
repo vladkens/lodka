@@ -42,6 +42,7 @@ pub fn poweroff(restart: bool) -> ! {
     libc::sync();
     libc::reboot(how);
   }
+
   std::process::exit(1)
 }
 
