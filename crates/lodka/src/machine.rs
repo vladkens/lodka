@@ -478,12 +478,19 @@ impl Machine {
         }
       }
 
-      // AFFINITY_INFO: 0 on, 1 off
+      // AFFINITY_INFO: 0 when a vCPU in the affinity instance is on, 2 when one is starting,
+      // else 1
       0x8400_0004 | 0xc400_0004 => {
+        let cpus = cpus_in(self.cfg.cpus, cpu.reg(hv::REG_X0 + 1), cpu.reg(hv::REG_X0 + 2));
         let st = self.cpus.state.lock().unwrap();
-        match self.cpu_index(cpu.reg(hv::REG_X0 + 1)) {
-          Some(i) => (!st.on[i]) as u64,
-          None => INVALID_PARAMETERS,
+        if cpus.is_empty() {
+          INVALID_PARAMETERS
+        } else if cpus.iter().any(|&i| st.on[i]) {
+          0
+        } else if cpus.iter().any(|&i| st.starts[i].is_some()) {
+          2
+        } else {
+          1
         }
       }
 
@@ -508,7 +515,7 @@ impl Machine {
 
   /// The vCPU with the affinity in a PSCI call's `target_cpu`.
   fn cpu_index(&self, target: u64) -> Option<usize> {
-    (0..self.cfg.cpus).find(|&i| mpidr(i) == target & 0xff_00ff_ffff)
+    cpus_in(self.cfg.cpus, target, 0).first().copied()
   }
 
   /// Idles a vCPU that ran WFI until an interrupt may be pending for it: its timer fires, or the
@@ -550,6 +557,15 @@ enum Next {
 /// Affinity of vCPU `i`: 16 to a cluster, so GICv3's 16-bit SGI target lists reach them all.
 fn mpidr(i: usize) -> u64 {
   (((i / 16) << 8) | (i % 16)) as u64
+}
+
+/// Of `n` vCPUs, those in the affinity instance of `target` at `level`: the affinity fields below
+/// the level don't count.
+fn cpus_in(n: usize, target: u64, level: u64) -> Vec<usize> {
+  // Aff3, Aff2, Aff1 and Aff0 at level 0, then one field fewer at each level up
+  const MASKS: [u64; 4] = [0xff_00ff_ffff, 0xff_00ff_ff00, 0xff_00ff_0000, 0xff_0000_0000];
+  let Some(&mask) = MASKS.get(level as usize) else { return Vec::new() };
+  (0..n).filter(|&i| mpidr(i) & mask == target & mask).collect()
 }
 
 fn advance(cpu: &hv::Cpu) {
@@ -652,6 +668,15 @@ mod tests {
     assert_eq!(mpidr(15), 15);
     assert_eq!(mpidr(16), 0x100);
     assert_eq!(mpidr(33), 0x201);
+  }
+
+  #[test]
+  fn affinity_instances() {
+    assert_eq!(cpus_in(20, 0x101, 0), [17]);
+    assert_eq!(cpus_in(20, 0x101, 1), (16..20).collect::<Vec<_>>());
+    assert_eq!(cpus_in(20, 0, 2), (0..20).collect::<Vec<_>>());
+    assert!(cpus_in(20, 0x200, 1).is_empty());
+    assert!(cpus_in(20, 0, 4).is_empty());
   }
 
   #[test]
