@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::{env, fs, io};
+use std::{env, fmt, fs, io};
 
 use crate::bad;
 
@@ -17,12 +17,12 @@ pub fn config_dir() -> PathBuf {
   xdg("XDG_CONFIG_HOME", ".config")
 }
 
-/// The VM's disk.
+/// The VM's disk and lodka's SSH key.
 pub fn data_dir() -> PathBuf {
   xdg("XDG_DATA_HOME", ".local/share")
 }
 
-/// What the running VM writes: its console, its lock and the Docker socket.
+/// What the running VM writes: logs, its lock, its address, the Docker socket.
 pub fn state_dir() -> PathBuf {
   xdg("XDG_STATE_HOME", ".local/state")
 }
@@ -50,9 +50,9 @@ pub fn pid_file() -> PathBuf {
   state_dir().join("lodka.pid")
 }
 
-/// The VM's lock, a write lock on the pid file: the VM holds it while it runs; None when taken.
-/// The file stays (a lock is on a file, not a name), and the holder never opens it again:
-/// closing any descriptor of it drops the process's locks.
+/// The VM's lock, a write lock on the pid file: the VM holds it while it runs, `lodka delete`
+/// while it deletes the disk; None when taken. The file stays (a lock is on a file, not a name),
+/// and the holder never opens it again: closing any descriptor of it drops the process's locks.
 pub fn lock() -> io::Result<Option<File>> {
   mkdir(&state_dir())?;
   let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(pid_file())?;
@@ -69,6 +69,19 @@ pub fn lock() -> io::Result<Option<File>> {
   }
 }
 
+/// The pid of the process that holds the VM's lock, asked of the kernel: the pid file's text
+/// is stale for a moment while a new VM takes the lock.
+pub fn running() -> Option<i32> {
+  let f = File::open(pid_file()).ok()?;
+  let mut l = whole_file(libc::F_WRLCK);
+  // SAFETY: as in `lock`; F_GETLK fills in `l`.
+  if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } != 0 {
+    return None;
+  }
+
+  (l.l_type != libc::F_UNLCK).then_some(l.l_pid)
+}
+
 fn whole_file(kind: libc::c_short) -> libc::flock {
   // SAFETY: a plain C struct, valid zeroed; a length of 0 locks to the end of the file.
   let mut l: libc::flock = unsafe { std::mem::zeroed() };
@@ -77,8 +90,25 @@ fn whole_file(kind: libc::c_short) -> libc::flock {
   l
 }
 
+pub fn log_file() -> PathBuf {
+  state_dir().join("lodka.log")
+}
+
 pub fn console_file() -> PathBuf {
   state_dir().join("console.log")
+}
+
+/// Removes what the last VM left behind: its address and the Docker socket. Called with the
+/// VM's lock held; the pid file stays, as the lock is on the file, not on its name.
+pub fn clear_state() {
+  for x in [ip_file(), docker_sock()] {
+    let _ = fs::remove_file(x);
+  }
+}
+
+/// The guest's address, written once its DHCP lease is known.
+pub fn ip_file() -> PathBuf {
+  state_dir().join("ip")
 }
 
 pub fn docker_sock() -> PathBuf {
@@ -87,6 +117,10 @@ pub fn docker_sock() -> PathBuf {
 
 pub fn disk_file() -> PathBuf {
   data_dir().join("data.img")
+}
+
+pub fn key_file() -> PathBuf {
+  data_dir().join("id_ed25519")
 }
 
 /// The guest's kernel (`Image`) and root file system (`rootfs.img`): from $LODKA_GUEST, next
@@ -107,6 +141,9 @@ pub fn guest_dir() -> io::Result<PathBuf> {
 }
 
 // MARK: Settings
+
+/// How `lodka start` gives the VM its settings, which the VM saves once it holds the lock.
+pub const SETTINGS_VAR: &str = "LODKA_SETTINGS";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -159,6 +196,21 @@ impl Settings {
 
     Ok(s)
   }
+
+  /// Saves them whole: a reader never sees half the file.
+  pub fn save(&self) -> io::Result<()> {
+    mkdir(&config_dir())?;
+    let tmp = Settings::path().with_extension("conf.new");
+    fs::write(&tmp, self.to_string())?;
+    fs::rename(tmp, Settings::path())
+  }
+}
+
+impl fmt::Display for Settings {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    writeln!(f, "# lodka's VM; memory and disk in GiB")?;
+    writeln!(f, "cpus = {}\nmemory = {}\ndisk = {}", self.cpus, self.memory, self.disk)
+  }
 }
 
 fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
@@ -195,6 +247,9 @@ mod tests {
     for x in ["cpus", "cpus = 0", "cpus = x", "swap = 1"] {
       assert!(Settings::parse(x).is_err(), "{x}");
     }
+
+    let s = Settings { cpus: 2, memory: 6, disk: 20 };
+    assert_eq!(Settings::parse(&s.to_string()).unwrap(), s);
   }
 
   #[test]
