@@ -8,7 +8,6 @@ mod sys;
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,13 +147,23 @@ fn var() -> io::Result<()> {
   mount("/var/lib/lodka/root", "/root", "", libc::MS_BIND, "")
 }
 
+/// sshd's host key, made on the first boot and synced at once: a VM stopped before the guest
+/// wrote it back left it empty, and sshd down on every boot after.
 fn host_key() -> io::Result<()> {
-  if Path::new(HOST_KEY).exists() {
+  if fs::metadata(HOST_KEY).is_ok_and(|x| x.len() > 0) {
     return Ok(());
   }
 
+  let public = format!("{HOST_KEY}.pub");
   fs::create_dir_all("/var/lib/lodka/ssh")?;
-  run("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-f", HOST_KEY])
+  let _ = fs::remove_file(HOST_KEY);
+  let _ = fs::remove_file(&public);
+  run("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-f", HOST_KEY])?;
+  for x in [HOST_KEY, &public] {
+    fs::File::open(x)?.sync_all()?;
+  }
+
+  Ok(())
 }
 
 /// Runs a command to its end; only while booting, before the reaper takes every exit.
@@ -217,8 +226,21 @@ fn start(name: &'static str, cmd: &[&str], files: Option<u64>) {
 
   match c.spawn() {
     Ok(x) => list.push((x.id(), name)),
-    Err(e) => log!("{name}: {e}"),
+    Err(e) => {
+      log!("{name}: {e}, starting it again");
+      again(name);
+    }
   }
+}
+
+/// Starts a service again in a second.
+fn again(name: &'static str) {
+  thread::spawn(move || {
+    thread::sleep(Duration::from_secs(1));
+    if let Some(&(_, cmd, files)) = SERVICES.iter().find(|x| x.0 == name) {
+      start(name, cmd, files);
+    }
+  });
 }
 
 /// Waits for every process that ends, as PID 1 must; starts a service again a second after it
@@ -242,12 +264,7 @@ fn reap() -> ! {
     }
 
     log!("{name} exited ({status:#x}), starting it again");
-    thread::spawn(move || {
-      thread::sleep(Duration::from_secs(1));
-      if let Some(&(_, cmd, files)) = SERVICES.iter().find(|x| x.0 == name) {
-        start(name, cmd, files);
-      }
-    });
+    again(name);
   }
 }
 
