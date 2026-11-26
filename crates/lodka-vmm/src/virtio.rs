@@ -5,7 +5,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{Ordering, fence};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,12 +32,20 @@ pub struct Queue {
   pub used: u64,
   next_avail: u16,
   next_used: u16,
+  /// Set when the driver resets the device: every copy of the queue stops using it, as the
+  /// driver may free its rings and buffers.
+  reset: Arc<AtomicBool>,
 }
 
 impl Queue {
+  /// Whether the device may use the queue: the driver set it up and hasn't reset it since.
+  fn live(&self) -> bool {
+    self.ready && !self.reset.load(Ordering::Acquire)
+  }
+
   /// Takes the next chain the driver made available.
   pub fn pop(&mut self, mem: &Mem) -> io::Result<Option<Chain>> {
-    if !self.ready || self.size == 0 {
+    if !self.live() || self.size == 0 {
       return Ok(None);
     }
 
@@ -80,14 +88,14 @@ impl Queue {
 
   /// Whether the driver made a chain available that `pop` hasn't taken.
   pub fn pending(&self, mem: &Mem) -> io::Result<bool> {
-    Ok(self.ready && mem.atomic_u16(self.avail + 2)?.load(Ordering::Acquire) != self.next_avail)
+    Ok(self.live() && mem.atomic_u16(self.avail + 2)?.load(Ordering::Acquire) != self.next_avail)
   }
 
   /// Tells the driver whether to notify when it makes chains available: not while the device
   /// works through the queue anyway, which saves a VM exit per request. Once notifications are
   /// back on, the device must check `pending`: a chain may have come in between.
   pub fn set_notify(&self, mem: &Mem, on: bool) -> io::Result<()> {
-    if !self.ready {
+    if !self.live() {
       return Ok(());
     }
 
@@ -100,7 +108,7 @@ impl Queue {
   /// Whether the driver wants an interrupt for used chains; it doesn't while it polls the
   /// queue, and looks at the used ring itself before it asks for them again.
   pub fn wants_irq(&self, mem: &Mem) -> bool {
-    if !self.ready {
+    if !self.live() {
       return false;
     }
 
@@ -111,6 +119,10 @@ impl Queue {
 
   /// Returns a chain to the driver with `len` bytes written into it.
   pub fn push(&mut self, mem: &Mem, head: u16, len: u32) -> io::Result<()> {
+    if !self.live() {
+      return Ok(());
+    }
+
     let slot = (self.next_used % self.size) as u64;
     let mut elem = [0u8; 8];
     elem[..4].copy_from_slice(&(head as u32).to_le_bytes());
@@ -358,7 +370,10 @@ pub struct Transport {
   drv_features: u64,
   sel: usize,
   queues: Vec<Queue>,
+  /// Serving the driver's queues now.
   active: bool,
+  /// Started once: a device's threads keep the queues it started with, so it starts only once.
+  started: bool,
 }
 
 impl Transport {
@@ -377,6 +392,7 @@ impl Transport {
       sel: 0,
       queues,
       active: false,
+      started: false,
     }
   }
 
@@ -389,8 +405,19 @@ impl Transport {
     const DEVICE_NEEDS_RESET: u32 = 0x40;
 
     if status == 0 {
-      // A reset; a started device keeps running until the VM stops (the guest resets devices
-      // only as it powers off).
+      // A reset: the device stops using the queues, which are the driver's to set up again. The
+      // guest resets a started device only as it powers off; a driver that binds to it again
+      // finds it needs a reset.
+      for q in &mut self.queues {
+        q.reset.store(true, Ordering::Release);
+        *q = Queue { max: q.max, ..Default::default() };
+      }
+
+      if self.irq.status() != 0 {
+        self.irq.ack(u32::MAX);
+      }
+
+      self.active = false;
       self.status = 0;
       return;
     }
@@ -400,7 +427,12 @@ impl Transport {
       return;
     }
 
-    self.active = true;
+    if self.started {
+      self.status |= DEVICE_NEEDS_RESET;
+      return;
+    }
+
+    (self.active, self.started) = (true, true);
     let queues = self.queues.clone();
     if let Err(e) = self.dev.activate(self.mem.clone(), queues, self.irq.clone()) {
       eprintln!("lodka: virtio device {}: {e}", self.dev.kind());
@@ -552,6 +584,50 @@ mod tests {
     assert_eq!(mem.read_u16(q.used + 2).unwrap(), 1);
     assert_eq!(mem.read_u32(q.used + 4).unwrap(), 0);
     assert_eq!(mem.read_u32(q.used + 8).unwrap(), 8);
+  }
+
+  /// Keeps the queues it is started with.
+  struct Probe(Arc<Mutex<Vec<Queue>>>);
+
+  impl Device for Probe {
+    fn kind(&self) -> u32 {
+      4
+    }
+
+    fn queues(&self) -> Vec<u16> {
+      vec![4]
+    }
+
+    fn activate(&mut self, _mem: Arc<Mem>, queues: Vec<Queue>, _irq: Irq) -> io::Result<()> {
+      self.0.lock().unwrap().extend(queues);
+      Ok(())
+    }
+
+    fn notify(&mut self, _queue: u16) {}
+  }
+
+  #[test]
+  fn reset_stops_a_started_device() {
+    let (mem, q) = setup();
+    let mem = Arc::new(mem);
+    let given = Arc::new(Mutex::new(Vec::new()));
+    let irq = Irq::new(32, Arc::new(|| {}));
+    let mut t = Transport::new(Box::new(Probe(given.clone())), mem.clone(), irq);
+    t.queues[0] = q.clone();
+    t.set_status(0xf); // ACKNOWLEDGE, DRIVER, FEATURES_OK, DRIVER_OK
+    assert_eq!(given.lock().unwrap().len(), 1);
+
+    desc(&mem, 0, BASE + 0x1000, 4, 0, 0);
+    offer(&mem, &q, 0, 0, 1);
+    t.set_status(0);
+    let mut started = given.lock().unwrap()[0].clone();
+    assert!(started.pop(&mem).unwrap().is_none());
+    assert!(!t.queues[0].ready);
+
+    t.queues[0] = Queue { reset: Default::default(), ..q };
+    t.set_status(0xf);
+    assert_eq!(given.lock().unwrap().len(), 1);
+    assert_ne!(t.status & 0x40, 0); // DEVICE_NEEDS_RESET
   }
 
   #[test]
