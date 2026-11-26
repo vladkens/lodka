@@ -38,7 +38,7 @@ pub fn serve() -> io::Result<()> {
   mkdir(&dirs::data_dir())?;
   let lock = lock()?;
   // A VM that didn't stop cleanly left its address behind; this one gets a new network.
-  let _ = fs::remove_file(dirs::ip_file());
+  dirs::clear_state();
 
   let s = Settings::load()?;
   let guest = dirs::guest_dir()?;

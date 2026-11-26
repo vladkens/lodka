@@ -56,9 +56,10 @@ pub fn console_file() -> PathBuf {
   state_dir().join("console.log")
 }
 
-/// Removes what a VM that no longer runs leaves behind: its address, the Docker socket, its pid.
+/// Removes what the last VM left behind: its address and the Docker socket. Called with the
+/// VM's lock held; the pid file stays, as the lock is on the file, not on its name.
 pub fn clear_state() {
-  for x in [ip_file(), docker_sock(), pid_file()] {
+  for x in [ip_file(), docker_sock()] {
     let _ = fs::remove_file(x);
   }
 }

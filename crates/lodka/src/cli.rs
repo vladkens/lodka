@@ -78,6 +78,8 @@ pub fn start(cpus: Option<u32>, memory: Option<u32>, disk: Option<u32>) -> io::R
   Err(bad(format!("Docker did not answer in {}s; see {}", START_WAIT.as_secs(), log.display())))
 }
 
+/// Asks the guest to power off; `force` kills the VM, which leaves its address and Docker socket
+/// for the next start to remove.
 pub fn stop(force: bool) -> io::Result<()> {
   let Some(pid) = running() else {
     println!("lodka: not running");
@@ -97,10 +99,6 @@ pub fn stop(force: bool) -> io::Result<()> {
     }
 
     thread::sleep(Duration::from_millis(50));
-  }
-
-  if force {
-    dirs::clear_state();
   }
 
   println!("lodka: stopped");
