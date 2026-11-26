@@ -26,3 +26,9 @@ update:
 
 clean:
 	cargo clean
+
+.PHONY: kernel
+
+# guest/out/Image, built in a container on OrbStack or Colima
+kernel:
+	scripts/build-guest.sh kernel
