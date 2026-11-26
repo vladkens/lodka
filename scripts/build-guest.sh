@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds the guest into guest/out/: `kernel` (Image), `rootfs` (rootfs.img, erofs) or `all`.
 # Runs itself in an Alpine container on a Docker that mounts the Mac's folders (OrbStack, Colima;
-# not lodka yet); `rootfs` needs the guest binary built first (`make guest`). Kernel sources stay in the `lodka-build` volume.
+# not lodka yet); `rootfs` needs the guest binary built first (`make guest`). Kernel sources stay
+# in the `lodka-build` volume.
 set -eu
 KVER=${KVER:-6.18.65}
 ALPINE=${ALPINE:-3.24}

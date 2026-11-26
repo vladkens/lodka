@@ -87,6 +87,13 @@ pub fn is_ext4(dev: &str) -> io::Result<bool> {
   Ok(buf[1080..1082] == [0x53, 0xef])
 }
 
+/// Whether nothing was ever written at the start of the device: a new disk, safe to format.
+pub fn is_blank(dev: &str) -> io::Result<bool> {
+  let mut buf = vec![0u8; 64 * 1024];
+  fs::File::open(dev)?.read_exact(&mut buf)?;
+  Ok(buf.iter().all(|&x| x == 0))
+}
+
 /// Grows the ext4 file system mounted at `dir` to fill its device `dev`, online, as resize2fs
 /// does: a no-op when it already fills it.
 pub fn grow_ext4(dir: &str, dev: &str) -> io::Result<()> {

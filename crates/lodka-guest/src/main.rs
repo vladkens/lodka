@@ -126,6 +126,11 @@ fn var() -> io::Result<()> {
   symlink("/run/lock", "/var/lock")?;
 
   if !sys::is_ext4(DATA_DEV)? {
+    if !sys::is_blank(DATA_DEV)? {
+      let msg = "the data disk has data but no ext4 file system; lodka delete makes a new disk";
+      return Err(io::Error::other(msg));
+    }
+
     log!("making the data disk's file system");
     // Lazy init: the disk is a sparse file, zeroes cost nothing to read back.
     let opts = "lazy_itable_init=1,lazy_journal_init=1,nodiscard";
@@ -203,8 +208,15 @@ fn start(name: &'static str, cmd: &[&str], files: Option<u64>) {
     };
   }
 
+  // Under the lock, so the reaper can't take the child for a stranger before it is listed, and
+  // a shutdown, which sets STOPPING before it looks, sees every service started.
+  let mut list = RUNNING.lock().unwrap();
+  if STOPPING.load(Ordering::Acquire) {
+    return;
+  }
+
   match c.spawn() {
-    Ok(x) => RUNNING.lock().unwrap().push((x.id(), name)),
+    Ok(x) => list.push((x.id(), name)),
     Err(e) => log!("{name}: {e}"),
   }
 }

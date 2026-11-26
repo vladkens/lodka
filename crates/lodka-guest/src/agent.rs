@@ -9,7 +9,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT, FORWARD_PORT};
 
@@ -21,6 +21,8 @@ const AUTHORIZED_KEYS: &str = "/run/lodka/authorized_keys";
 const STOP_WAIT: Duration = Duration::from_secs(12);
 /// The ports below aren't the containers': sshd's own.
 const OWN_PORTS: &[u16] = &[22];
+/// The ports are told again this often unchanged, so lodka tries again those it couldn't take.
+const PORTS_AGAIN: Duration = Duration::from_secs(10);
 
 /// The current control connection and what it was last told.
 struct Link {
@@ -28,11 +30,12 @@ struct Link {
   addr: Option<String>,
   docker: bool,
   ports: Option<Vec<u16>>,
+  ports_told: Option<Instant>,
 }
 
 impl Link {
   const fn new(out: Option<UnixStream>) -> Link {
-    Link { out, addr: None, docker: false, ports: None }
+    Link { out, addr: None, docker: false, ports: None, ports_told: None }
   }
 
   /// Sends a line to lodka; false when it isn't connected.
@@ -131,8 +134,10 @@ fn tell() {
     link.docker = true;
   }
 
-  if link.ports.as_ref() != Some(&ports) && link.send(&Ctl::Ports(ports.clone())) {
+  let stale = link.ports_told.is_none_or(|x| x.elapsed() >= PORTS_AGAIN);
+  if (stale || link.ports.as_ref() != Some(&ports)) && link.send(&Ctl::Ports(ports.clone())) {
     link.ports = Some(ports);
+    link.ports_told = Some(Instant::now());
   }
 }
 

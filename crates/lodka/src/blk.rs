@@ -170,7 +170,14 @@ fn request(
         return Err(io::Error::last_os_error());
       }
 
-      (S_OK, len) // past the end of the file reads as zeroes the guest never asked for
+      // Past the end of the file (its last sector, when its size isn't a whole number of them)
+      // reads as zeroes.
+      let n = n as usize;
+      if n < len {
+        chain.write_at(mem, n, &vec![0u8; len - n])?;
+      }
+
+      (S_OK, len)
     }
     T_OUT if ro => (S_IOERR, 0),
     T_OUT => {

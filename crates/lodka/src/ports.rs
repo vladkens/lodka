@@ -4,7 +4,7 @@
 //! and ::1 whose connections go into the guest over vsock, not to its address on the shared
 //! network: macOS lets a process reach that address only with the Local Network permission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -18,16 +18,20 @@ pub type Dial = Arc<dyn Fn(u16) -> io::Result<UnixStream> + Send + Sync>;
 pub struct Ports {
   dial: Dial,
   open: HashMap<u16, Fwd>,
+  /// Those that couldn't be listened on, logged once.
+  failed: HashSet<u16>,
 }
 
 impl Ports {
   pub fn new(dial: Dial) -> Ports {
-    Ports { dial, open: HashMap::new() }
+    Ports { dial, open: HashMap::new(), failed: HashSet::new() }
   }
 
-  /// The ports the guest listens on now.
+  /// The ports the guest listens on now. The guest tells them again every few seconds, so a port
+  /// taken on the Mac gets its listener once it is free.
   pub fn update(&mut self, ports: &[u16]) {
     self.open.retain(|port, _| ports.contains(port));
+    self.failed.retain(|port| ports.contains(port));
     for &port in ports {
       if self.open.contains_key(&port) {
         continue;
@@ -35,9 +39,11 @@ impl Ports {
 
       match Fwd::open(port, &self.dial) {
         Ok(x) => {
+          self.failed.remove(&port);
           self.open.insert(port, x);
         }
-        Err(e) => eprintln!("lodka: port {port}: {e}"),
+        Err(e) if self.failed.insert(port) => eprintln!("lodka: port {port}: {e}"),
+        Err(_) => {}
       }
     }
   }
