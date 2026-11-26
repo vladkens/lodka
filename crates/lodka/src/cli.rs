@@ -37,12 +37,12 @@ pub fn start(cpus: Option<u32>, memory: Option<u32>, disk: Option<u32>) -> io::R
   }
 
   dirs::guest_dir()?;
-  s.save()?;
   mkdir(&dirs::state_dir())?;
   let exe = signed()?;
   let log = File::create(dirs::log_file())?;
   let mut child = Command::new(exe);
-  child.arg("_vm").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+  child.arg("_vm").env(dirs::SETTINGS_VAR, s.to_string());
+  child.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
   // SAFETY: setsid is async-signal-safe; the VM leaves the terminal's session, so closing the
   // terminal doesn't stop it.
   unsafe {
@@ -179,11 +179,15 @@ pub fn delete(force: bool) -> io::Result<()> {
     stop(false)?;
   }
 
-  // Under the VM's lock: a VM started now would run on a deleted disk.
+  // Under the VM's lock: a VM started now would run on a deleted disk. Only lodka's files: the
+  // folder may be the state's too.
   let _lock = dirs::lock()?.ok_or_else(|| bad("delete: the VM started again"))?;
-  match fs::remove_dir_all(dirs::data_dir()) {
-    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-    _ => {}
+  let key = dirs::key_file();
+  for x in [dirs::disk_file(), key.with_extension("pub"), key] {
+    match fs::remove_file(x) {
+      Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+      _ => {}
+    }
   }
 
   println!("lodka: deleted");

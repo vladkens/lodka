@@ -38,7 +38,16 @@ pub fn serve() -> io::Result<()> {
   dirs::clear_state();
   mkdir(&dirs::data_dir())?;
 
-  let s = Settings::load()?;
+  // Saved only by the VM that got the lock; a reboot's VM loads them.
+  let s = match env::var(dirs::SETTINGS_VAR) {
+    Ok(x) => {
+      let s = Settings::parse(&x)?;
+      s.save()?;
+      s
+    }
+    Err(_) => Settings::load()?,
+  };
+
   let guest = dirs::guest_dir()?;
   let disk = disk(&s)?;
   let key = key()?;
@@ -107,7 +116,8 @@ pub fn serve() -> io::Result<()> {
     Stop::Poweroff => eprintln!("lodka: powered off"),
     Stop::Reboot => {
       eprintln!("lodka: rebooting");
-      Command::new(env::current_exe()?).arg("_vm").stdin(Stdio::null()).spawn()?;
+      let mut c = Command::new(env::current_exe()?);
+      c.arg("_vm").env_remove(dirs::SETTINGS_VAR).stdin(Stdio::null()).spawn()?;
     }
     Stop::Error(e) => return Err(bad(e)),
   }

@@ -142,6 +142,9 @@ pub fn guest_dir() -> io::Result<PathBuf> {
 
 // MARK: Settings
 
+/// How `lodka start` gives the VM its settings, which the VM saves once it holds the lock.
+pub const SETTINGS_VAR: &str = "LODKA_SETTINGS";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
   pub cpus: u32,
@@ -174,7 +177,7 @@ impl Settings {
     }
   }
 
-  fn parse(text: &str) -> io::Result<Settings> {
+  pub fn parse(text: &str) -> io::Result<Settings> {
     let mut s = Settings::default();
     for line in text.lines().map(str::trim).filter(|x| !x.is_empty() && !x.starts_with('#')) {
       let (key, value) = line.split_once('=').ok_or_else(|| bad(format!("lodka.conf: {line}")))?;
@@ -194,9 +197,12 @@ impl Settings {
     Ok(s)
   }
 
+  /// Saves them whole: a reader never sees half the file.
   pub fn save(&self) -> io::Result<()> {
     mkdir(&config_dir())?;
-    fs::write(Settings::path(), self.to_string())
+    let tmp = Settings::path().with_extension("conf.new");
+    fs::write(&tmp, self.to_string())?;
+    fs::rename(tmp, Settings::path())
   }
 }
 
