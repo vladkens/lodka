@@ -1,0 +1,11 @@
+[package]
+name = "lodka-vmm"
+description = "lodka's VMM: a VM on Hypervisor.framework that boots an arm64 Linux kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2.191"

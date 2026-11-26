@@ -8,3 +8,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+libc = "0.2.191"
+lodka-vmm = { version = "0.1.0", path = "../lodka-vmm" }
