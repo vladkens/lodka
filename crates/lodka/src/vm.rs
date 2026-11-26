@@ -2,10 +2,11 @@
 //! The process that runs the VM (`lodka _vm`): makes the data disk on first use, boots the guest
 //! from its root file system with its console in a log file, and runs it until it powers off.
 
+use std::env;
 use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::{env, io};
 
 use lodka_vmm::blk::Blk;
 use lodka_vmm::console::{Console, Rng};
@@ -15,7 +16,7 @@ use crate::bad;
 use crate::dirs::{self, GIB, Settings, mkdir};
 
 pub fn serve() -> io::Result<()> {
-  mkdir(&dirs::state_dir())?;
+  let _lock = lock()?;
   mkdir(&dirs::data_dir())?;
   let s = Settings::load()?;
   let guest = dirs::guest_dir()?;
@@ -54,6 +55,15 @@ pub fn serve() -> io::Result<()> {
   }
 
   Ok(())
+}
+
+/// Takes the VM's lock, held as long as the process runs: one VM on the disk at a time. The pid
+/// goes into its file for people.
+fn lock() -> io::Result<File> {
+  let mut f = dirs::lock()?.ok_or_else(|| bad("the VM runs already"))?;
+  f.set_len(0)?;
+  writeln!(f, "{}", std::process::id())?;
+  Ok(f)
 }
 
 /// The data disk, sparse: it takes on the Mac only what the guest writes. It grows when the
