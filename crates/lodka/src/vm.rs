@@ -1,21 +1,24 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
-//! The process that runs the VM (`lodka _vm`): makes the disk and the network on first use,
-//! boots the guest, serves Docker's socket and the control channel, and powers the guest off
-//! cleanly on SIGTERM.
+//! The process that runs the VM (`lodka _vm`, started by `lodka start`): makes the disk, the SSH
+//! key and the network on first use, boots the guest, serves Docker's socket and the control
+//! channel, forwards the guest's ports to the Mac's localhost, and powers the guest off cleanly
+//! on SIGTERM.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
-use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT};
+use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT, FORWARD_PORT};
 use lodka_vmm::blk::Blk;
 use lodka_vmm::console::{Console, Rng};
 use lodka_vmm::machine::{Config, Machine, Stop, Stopper};
@@ -24,6 +27,7 @@ use lodka_vmm::vsock::{self, Connector, Listener, Vsock};
 
 use crate::bad;
 use crate::dirs::{self, GIB, Settings, mkdir};
+use crate::ports::{Dial, Ports};
 
 /// How long the guest gets to power off after SIGTERM before the VM is stopped.
 const POWEROFF_WAIT: Duration = Duration::from_secs(15);
@@ -31,15 +35,30 @@ const POWEROFF_WAIT: Duration = Duration::from_secs(15);
 const TIME_EVERY: Duration = Duration::from_secs(30);
 /// How long a control line may wait for the guest to take it.
 const SEND_WAIT: Duration = Duration::from_secs(1);
+/// The VM's lock, which a rebooted VM leaves open for the next one in its process.
+const LOCK_FD_VAR: &str = "LODKA_LOCK_FD";
 
 pub fn serve() -> io::Result<()> {
   let t0 = Instant::now();
   let signals = block_signals();
-  let _lock = lock()?;
+  let lock = lock()?;
+  // A VM that didn't stop cleanly left its address behind; this one gets a new network.
+  dirs::clear_state();
   mkdir(&dirs::data_dir())?;
-  let s = Settings::load()?;
+
+  // Saved only by the VM that got the lock; a reboot's VM loads them.
+  let s = match env::var(dirs::SETTINGS_VAR) {
+    Ok(x) => {
+      let s = Settings::parse(&x)?;
+      s.save()?;
+      s
+    }
+    Err(_) => Settings::load()?,
+  };
+
   let guest = dirs::guest_dir()?;
   let (disk, blank) = disk(&s)?;
+  let key = key()?;
   let console = Arc::new(Mutex::new(File::create(dirs::console_file())?));
 
   let mut cmdline =
@@ -66,7 +85,13 @@ pub fn serve() -> io::Result<()> {
   let mac = net.mac.map(|x| format!("{x:02x}")).join(":");
   eprintln!("lodka: {} cpus, {} GiB memory, mac {mac}", s.cpus, s.memory);
 
-  let ctl = Arc::new(Control { cur: Mutex::default(), opened: AtomicU64::new(0), t0 });
+  let ctl = Arc::new(Control {
+    cur: Mutex::default(),
+    opened: AtomicU64::new(0),
+    ports: Mutex::new(None),
+    key,
+    t0,
+  });
   let mut listeners: HashMap<u32, Listener> = HashMap::new();
   let c = ctl.clone();
   listeners.insert(
@@ -89,6 +114,7 @@ pub fn serve() -> io::Result<()> {
   m.add(Box::new(net));
   m.add(Box::new(vsock));
 
+  *ctl.ports.lock().unwrap() = Some(Ports::new(dial(conn.clone())));
   docker(conn)?;
   let c = ctl.clone();
   thread::Builder::new().name("time".into()).spawn(move || {
@@ -100,23 +126,49 @@ pub fn serve() -> io::Result<()> {
   watch_signals(signals, ctl, m.stopper())?;
 
   let stop = m.run()?;
-  let _ = fs::remove_file(dirs::docker_sock());
+  dirs::clear_state();
 
   match stop {
     Stop::Poweroff => eprintln!("lodka: powered off"),
-    Stop::Reboot => eprintln!("lodka: the guest restarted, stopped"),
+    Stop::Reboot => {
+      eprintln!("lodka: rebooting");
+      return Err(reboot(&lock));
+    }
     Stop::Error(e) => return Err(bad(e)),
   }
 
   Ok(())
 }
 
+/// Runs the next VM in this process with the lock kept open across exec, so it holds on: no
+/// `stop` or `delete` gets in between. Returns only when exec fails.
+fn reboot(lock: &File) -> io::Error {
+  let fd = lock.as_raw_fd();
+  // SAFETY: clears close-on-exec on a descriptor of ours.
+  if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+    return io::Error::last_os_error();
+  }
+
+  let exe = match env::current_exe() {
+    Ok(x) => x,
+    Err(e) => return e,
+  };
+
+  let mut c = Command::new(exe);
+  c.arg("_vm").env_remove(dirs::SETTINGS_VAR).env(LOCK_FD_VAR, fd.to_string()).exec()
+}
+
 // MARK: Files
 
-/// Takes the VM's lock, held as long as the process runs: one VM on the disk at a time. The pid
-/// goes into its file for people.
+/// Takes the VM's lock, held as long as the process runs, and writes the pid into its file for
+/// people; lodka asks the lock.
 fn lock() -> io::Result<File> {
-  let mut f = dirs::lock()?.ok_or_else(|| bad("the VM runs already"))?;
+  let mut f = match env::var(LOCK_FD_VAR).ok().and_then(|x| x.parse().ok()) {
+    // SAFETY: the descriptor the VM before this one in the process left open, with its lock.
+    Some(fd) => unsafe { File::from_raw_fd(fd) },
+    None => dirs::lock()?.ok_or_else(|| bad("the VM runs already"))?,
+  };
+
   f.set_len(0)?;
   writeln!(f, "{}", std::process::id())?;
   Ok(f)
@@ -128,16 +180,16 @@ fn lock() -> io::Result<File> {
 fn disk(s: &Settings) -> io::Result<(File, bool)> {
   let path = dirs::disk_file();
   let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-  // SAFETY: flock on an open file.
-  if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-    let e = io::Error::last_os_error();
-    return Err(match e.raw_os_error() {
-      Some(libc::EWOULDBLOCK) => bad(format!("{}: another VM uses it", path.display())),
-      _ => e,
-    });
+  if !dirs::lock_disk(&f)? {
+    return Err(bad(format!("{}: another VM uses it", path.display())));
   }
 
+  // `lodka delete` may have removed the file between the open and the lock.
   let meta = f.metadata()?;
+  if fs::metadata(&path).map(|x| x.ino()).ok() != Some(meta.ino()) {
+    return Err(bad(format!("{}: deleted as the VM started", path.display())));
+  }
+
   let (have, want, blank) = (meta.len(), s.disk as u64 * GIB, meta.blocks() == 0);
   if have < want {
     f.set_len(want)?;
@@ -150,6 +202,25 @@ fn disk(s: &Settings) -> io::Result<(File, bool)> {
   }
 
   Ok((f, blank))
+}
+
+/// lodka's SSH key into the guest, made on first use; returns the public half.
+fn key() -> io::Result<String> {
+  let path = dirs::key_file();
+  let public = path.with_extension("pub");
+  if !public.exists() {
+    let _ = fs::remove_file(&path);
+    let st = Command::new("ssh-keygen")
+      .args(["-q", "-t", "ed25519", "-N", "", "-C", "lodka", "-f"])
+      .arg(&path)
+      .stdin(Stdio::null())
+      .status()?;
+    if !st.success() {
+      return Err(bad(format!("ssh-keygen: {st}")));
+    }
+  }
+
+  Ok(fs::read_to_string(public)?.trim().to_string())
 }
 
 // MARK: Docker
@@ -171,12 +242,27 @@ fn docker(conn: Connector) -> io::Result<()> {
   Ok(())
 }
 
+/// Each connection to a forwarded port: a vsock stream to the guest that starts with the Mac's
+/// address it came to.
+fn dial(conn: Connector) -> Dial {
+  Arc::new(move |addr| {
+    let (a, mut b) = vsock::pair()?;
+    writeln!(b, "{addr}")?;
+    conn.connect(FORWARD_PORT, a);
+    Ok(b)
+  })
+}
+
 // MARK: Control
 
 struct Control {
   cur: Mutex<Current>,
   /// How many connections the guest opened: each one's number, in the order it opened them.
   opened: AtomicU64,
+  /// The guest's ports on the Mac, kept across connections; set before the guest boots, once
+  /// the vsock device that dials them is made.
+  ports: Mutex<Option<Ports>>,
+  key: String,
   t0: Instant,
 }
 
@@ -232,14 +318,23 @@ impl Control {
     drop(cur);
 
     self.send(&Ctl::now());
+    self.send(&Ctl::Key(self.key.clone()));
 
     let secs = || self.t0.elapsed().as_secs_f32();
     for line in BufReader::new(stream).lines() {
       let line = line?;
       match Ctl::parse(&line) {
         Some(Ctl::Hello { version }) => eprintln!("lodka: guest {version} up in {:.2}s", secs()),
-        Some(Ctl::Addr(ip)) => eprintln!("lodka: guest address {ip}"),
+        Some(Ctl::Addr(ip)) => {
+          eprintln!("lodka: guest address {ip}");
+          fs::write(dirs::ip_file(), &ip)?;
+        }
         Some(Ctl::Docker) => eprintln!("lodka: docker up in {:.2}s", secs()),
+        Some(Ctl::Ports(x)) => {
+          if let Some(p) = self.ports.lock().unwrap().as_mut() {
+            p.update(&x);
+          }
+        }
         _ => eprintln!("lodka: control: unexpected {line:?}"),
       }
     }

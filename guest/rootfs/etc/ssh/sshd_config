@@ -1,0 +1,11 @@
+# lodka's sshd: root logs in with lodka's key only. The host key lives on the data disk, the
+# authorized key comes from lodka at each boot.
+HostKey /var/lib/lodka/ssh/ssh_host_ed25519_key
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthorizedKeysFile /run/lodka/authorized_keys .ssh/authorized_keys
+UseDNS no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp internal-sftp

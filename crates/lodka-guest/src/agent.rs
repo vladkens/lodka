@@ -1,31 +1,39 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
-//! The guest's side of the link to lodka on the Mac: the control channel (the clock, power off;
-//! the guest's address and Docker's state back), and the connections lodka opens to Docker's
-//! API, joined to dockerd's socket.
+//! The guest's side of the link to lodka on the Mac: the control channel (the clock, the SSH
+//! key, power off; the guest's address, Docker's state and its listening ports back), and the
+//! connections lodka opens: Docker's API, joined to dockerd's socket, and the forwarded ports.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::Shutdown;
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT};
+use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT, FORWARD_PORT};
 
 use crate::{log, shutdown, sys};
 
 const DOCKER_SOCK: &str = "/run/docker.sock";
+const AUTHORIZED_KEYS: &str = "/run/lodka/authorized_keys";
+/// The ports below aren't the containers': sshd's own.
+const OWN_PORTS: &[u16] = &[22];
+/// The ports are told again this often unchanged, so lodka tries again those it couldn't take.
+const PORTS_AGAIN: Duration = Duration::from_secs(10);
 
 /// The current control connection and what it was last told.
 struct Link {
   out: Option<UnixStream>,
   addr: Option<String>,
   docker: bool,
+  ports: Option<Vec<u16>>,
+  ports_told: Option<Instant>,
 }
 
 impl Link {
   const fn new(out: Option<UnixStream>) -> Link {
-    Link { out, addr: None, docker: false }
+    Link { out, addr: None, docker: false, ports: None, ports_told: None }
   }
 
   /// Sends a line to lodka; false when it isn't connected.
@@ -47,6 +55,7 @@ pub fn start() {
   spawn("control", control);
   spawn("report", report);
   spawn("docker", || listen(DOCKER_PORT, docker));
+  spawn("forward", || listen(FORWARD_PORT, forward));
 }
 
 fn spawn(name: &str, f: fn()) {
@@ -82,6 +91,10 @@ fn serve(stream: UnixStream) -> io::Result<()> {
           log!("clock set from the Mac's");
         }
       }
+      Some(Ctl::Key(key)) => {
+        std::fs::create_dir_all("/run/lodka")?;
+        std::fs::write(AUTHORIZED_KEYS, format!("{key}\n"))?;
+      }
       Some(Ctl::Poweroff) => shutdown(false),
       _ => log!("control: unexpected {line:?}"),
     }
@@ -98,9 +111,11 @@ fn report() {
   }
 }
 
-/// Tells lodka what changed: the address, Docker coming up.
+/// Tells lodka what changed: the address, Docker coming up, the ports.
 fn tell() {
   let addr = sys::ipv4("eth0").map(|x| x.to_string());
+  let ports: Vec<u16> =
+    sys::listening_ports().into_iter().filter(|x| !OWN_PORTS.contains(x)).collect();
   let mut link = LINK.lock().unwrap();
   if link.out.is_none() {
     return;
@@ -115,6 +130,12 @@ fn tell() {
 
   if !link.docker && docker_up() && link.send(&Ctl::Docker) {
     link.docker = true;
+  }
+
+  let stale = link.ports_told.is_none_or(|x| x.elapsed() >= PORTS_AGAIN);
+  if (stale || link.ports.as_ref() != Some(&ports)) && link.send(&Ctl::Ports(ports.clone())) {
+    link.ports = Some(ports);
+    link.ports_told = Some(Instant::now());
   }
 }
 
@@ -159,6 +180,41 @@ fn listen(port: u32, join: fn(UnixStream) -> io::Result<()>) {
 
 fn docker(x: UnixStream) -> io::Result<()> {
   splice(x, UnixStream::connect(DOCKER_SOCK)?);
+  Ok(())
+}
+
+/// Joins a connection to the port of the Mac's address its first line names, on the guest's
+/// loopback of the same family first: a container that has only `[::]:8080` and another with
+/// only `0.0.0.0:8080` each get theirs. Whatever listens on every address answers there too.
+fn forward(mut x: UnixStream) -> io::Result<()> {
+  let mut line = Vec::new();
+  let mut b = [0u8; 1];
+  // A byte at a time: what follows the line is the connection's own data.
+  loop {
+    x.read_exact(&mut b)?;
+    if b[0] == b'\n' {
+      break;
+    }
+
+    if line.len() == "127.0.0.1:65535".len() {
+      return Err(io::Error::other("forward: the address line is too long"));
+    }
+
+    line.push(b[0]);
+  }
+
+  let addr: SocketAddr = std::str::from_utf8(&line)
+    .ok()
+    .and_then(|x| x.parse().ok())
+    .ok_or_else(|| io::Error::other(format!("forward: bad address {line:?}")))?;
+  let port = addr.port();
+  let (v4, v6) =
+    (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), (Ipv6Addr::LOCALHOST, port).into());
+  let to = if addr.is_ipv6() { [v6, v4] } else { [v4, v6] };
+  let tcp = TcpStream::connect(&to[..])?;
+  tcp.set_nodelay(true)?;
+  // As the vsock streams: a UnixStream only reads, writes and shuts down its descriptor.
+  splice(x, UnixStream::from(OwnedFd::from(tcp)));
   Ok(())
 }
 

@@ -212,3 +212,54 @@ pub fn ipv4(name: &str) -> Option<Ipv4Addr> {
     found
   }
 }
+
+/// The TCP ports listened on for any address, from /proc/net/tcp and tcp6.
+pub fn listening_ports() -> Vec<u16> {
+  let mut ports: Vec<u16> = ["/proc/net/tcp", "/proc/net/tcp6"]
+    .into_iter()
+    .filter_map(|x| fs::read_to_string(x).ok())
+    .flat_map(|x| parse_listening(&x))
+    .collect();
+  ports.sort_unstable();
+  ports.dedup();
+  ports
+}
+
+fn parse_listening(text: &str) -> Vec<u16> {
+  let mut ports = Vec::new();
+  for line in text.lines().skip(1) {
+    let mut cols = line.split_whitespace().skip(1);
+    let (Some(local), Some(_), Some(state)) = (cols.next(), cols.next(), cols.next()) else {
+      continue;
+    };
+
+    let Some((addr, port)) = local.split_once(':') else { continue };
+    if state != "0A" || addr.bytes().any(|x| x != b'0') {
+      continue; // not LISTEN, or not on every address
+    }
+
+    if let Ok(port) = u16::from_str_radix(port, 16) {
+      ports.push(port);
+    }
+  }
+
+  ports
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn listening() {
+    let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1
+   1: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2 1
+   2: 0F02000A:0016 0202000A:C350 01 00000000:00000000 00:00000000 00000000     0        0 3 1";
+    assert_eq!(parse_listening(tcp), [8080]);
+
+    let tcp6 = "  sl  local_address remote_address st
+   0: 00000000000000000000000000000000:01BB 00000000000000000000000000000000:0000 0A 0";
+    assert_eq!(parse_listening(tcp6), [443]);
+  }
+}
