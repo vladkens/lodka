@@ -1,0 +1,101 @@
+name: main
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR runs cancel older ones. A main run is never cancelled mid-way; a release commit gets its own group, so it is never replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ startsWith(github.event.head_commit.message, 'release:') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: rustup update --no-self-update stable && rustup default stable
+      - run: rustup target add aarch64-unknown-linux-musl # the guest's binary, linted too
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - run: make check
+      - run: make test
+
+  # The guest's kernel and root file system, built in a container: macOS runners have no Docker.
+  # Only for what rust-build builds below: a release PR or commit, or a manual run.
+  images:
+    if: "github.event_name == 'workflow_dispatch' || startsWith(github.event.pull_request.title, 'release: v') || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v'))"
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update --no-self-update stable && rustup default stable
+      - run: rustup target add aarch64-unknown-linux-musl
+      - id: kernel
+        uses: actions/cache@v6
+        with:
+          key: kernel-${{ hashFiles('guest/kernel.config', 'guest/patches/**', 'scripts/build-guest.sh') }}
+          path: guest/out/Image
+
+      - if: steps.kernel.outputs.cache-hit != 'true'
+        run: make kernel
+      - run: make rootfs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: guest
+          path: |
+            guest/out/Image
+            guest/out/rootfs.img
+          if-no-files-found: error
+
+  # vladkens/actions: build makes the archive with the guest; publish ships the release on a release: commit.
+  build:
+    needs: images
+    runs-on: macos-latest # Hypervisor.framework: the binary needs a Mac
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: guest
+          path: guest/out
+
+      - run: rustup update --no-self-update stable && rustup default stable
+      - uses: vladkens/actions/rust-build@v1
+        with:
+          dist: make dist
+          crates: false
+
+  publish:
+    if: github.ref == 'refs/heads/main'
+    needs: [test, build]
+    runs-on: ubuntu-latest # never compiles
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write # attestations
+    steps:
+      - uses: actions/checkout@v7
+      - id: release
+        uses: vladkens/actions/rust-publish@v1
+        with:
+          crates: false
+          dev: false
+
+      - uses: vladkens/actions/homebrew-bump@v1
+        with:
+          tag: ${{ steps.release.outputs.tag }}
+          file: ${{ steps.release.outputs.files }}
+          tap: vladkens/homebrew-tap
+          token: ${{ secrets.HOMEBREW_REPO_TOKEN }}

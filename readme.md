@@ -18,6 +18,12 @@ Requires a Mac with Apple silicon on macOS 26 or later.
 ## Install
 
 ```sh
+brew install vladkens/tap/lodka
+```
+
+Or from the sources:
+
+```sh
 git clone https://github.com/vladkens/lodka && cd lodka
 make build images    # the guest is built in a container: OrbStack or Colima running
 cp target/release/lodka /usr/local/bin/ && mkdir -p /usr/local/share/lodka

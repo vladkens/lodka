@@ -29,7 +29,7 @@ update:
 clean:
 	cargo clean
 
-.PHONY: guest kernel rootfs images
+.PHONY: guest kernel rootfs images dist
 
 # The guest's PID 1, static for Linux on arm64
 guest:
@@ -43,3 +43,11 @@ rootfs: guest
 	scripts/build-guest.sh rootfs
 
 images: kernel rootfs
+
+# The release archive for CI's rust-build: the binary, the guest (make images) and the readme
+dist:
+	cargo build $(CARGO_FLAGS) -p lodka
+	rm -rf target/distrib && mkdir -p target/distrib
+	tar -czf target/distrib/lodka-dev-aarch64-apple-darwin.tar.gz -C $(CURDIR)/target/release lodka \
+		-C $(CURDIR)/guest/out Image rootfs.img -C $(CURDIR) readme.md LICENSE
+	tar -tvzf target/distrib/lodka-dev-aarch64-apple-darwin.tar.gz
