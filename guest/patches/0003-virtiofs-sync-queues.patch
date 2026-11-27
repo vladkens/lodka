@@ -1,0 +1,227 @@
+virtiofs: sync queues served by a hypercall on the calling vCPU
+
+A request a task waits for goes on its CPU's sync queue, and an HVC (VIRTIO_FS_HVC_SYNC, a
+vendor hypervisor call) has lodka serve that queue on the vCPU's own thread before it returns;
+the request ends right there. No device thread to wake, no interrupt, no kworker, no wakeup of
+the waiting task: a LOOKUP or GETATTR costs one exit to the host. Fsyncs, lock waits and I/O
+over 128 KiB stay on the request queues, served by threads, as they would hold the vCPU.
+Prior art: libkrun's VIRTIO_FS_F_SYNC, with an MMIO notify in place of the HVC.
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index 5a56356..806a7f3 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -5,11 +5,14 @@
+  */
+ 
+ #include <linux/fs.h>
++#include <linux/arm-smccc.h>
+ #include <linux/dax.h>
+ #include <linux/fsnotify.h>
+ #include <linux/iversion.h>
+ #include <linux/namei.h>
+ #include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
+ #include <linux/interrupt.h>
+ #include <linux/group_cpus.h>
+ #include <linux/memremap.h>
+@@ -31,6 +34,13 @@
+  */
+ #define FUSE_HEADER_OVERHEAD    4
+ 
++/*
++ * lodka's hypercall: serve the sync queue in x2 of the virtio-mmio device at x1, before
++ * returning (a vendor-specific hypervisor service, SMCCC 1.1)
++ */
++#define VIRTIO_FS_HVC_SYNC	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_64, \
++						   ARM_SMCCC_OWNER_VENDOR_HYP, 0x100)
++
+ /* List of virtio-fs device instances and a lock for the list. Also provides
+  * mutual exclusion in device removal and mounting path
+  */
+@@ -77,6 +87,9 @@ struct virtio_fs {
+ 	unsigned int notify_vq;          /* the notification queue, 0 for none */
+ 	unsigned int notify_buf_size;
+ 	void *notify_bufs;
++	unsigned int sync_vq;            /* the first sync queue, 0 for none */
++	unsigned int num_sync_queues;
++	phys_addr_t mmio_base;           /* names the device in VIRTIO_FS_HVC_SYNC */
+ 	struct dax_device *dax_dev;
+ 
+ 	unsigned int *mq_map; /* index = cpu id, value = request vq id */
+@@ -1243,6 +1256,21 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 	}
+ 	desc.pre_vectors = fs->req_vq;
+ 	fs->nvqs = fs->req_vq + fs->num_request_queues;
++	if (virtio_has_feature(vdev, VIRTIO_FS_F_SYNC) && dev_is_platform(vdev->dev.parent)) {
++		struct resource *r;
++
++		r = platform_get_resource(to_platform_device(vdev->dev.parent), IORESOURCE_MEM, 0);
++		virtio_cread_le(vdev, struct virtio_fs_config, num_sync_queues,
++				&fs->num_sync_queues);
++		fs->num_sync_queues = min_t(unsigned int, fs->num_sync_queues, nr_cpu_ids);
++		if (r && fs->num_sync_queues) {
++			fs->mmio_base = r->start;
++			fs->sync_vq = fs->nvqs;
++			fs->nvqs += fs->num_sync_queues;
++		} else {
++			fs->num_sync_queues = 0;
++		}
++	}
+ 	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
+ 	if (!fs->vqs)
+ 		return -ENOMEM;
+@@ -1269,7 +1297,7 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 	}
+ 
+ 	/* Initialize the requests virtqueues */
+-	for (i = fs->req_vq; i < fs->nvqs; i++) {
++	for (i = fs->req_vq; i < fs->req_vq + fs->num_request_queues; i++) {
+ 		char vq_name[VQ_NAME_LEN];
+ 
+ 		snprintf(vq_name, VQ_NAME_LEN, "requests.%u", i - fs->req_vq);
+@@ -1278,6 +1306,15 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 		vqs_info[i].name = fs->vqs[i].name;
+ 	}
+ 
++	/* The sync queues: no interrupts, the hypercall's return is the completion */
++	for (i = fs->sync_vq; i && i < fs->nvqs; i++) {
++		char vq_name[VQ_NAME_LEN];
++
++		snprintf(vq_name, VQ_NAME_LEN, "sync.%u", i - fs->sync_vq);
++		virtio_fs_init_vq(&fs->vqs[i], vq_name, VQ_REQUEST);
++		vqs_info[i].name = fs->vqs[i].name;
++	}
++
+ 	ret = virtio_find_vqs(vdev, fs->nvqs, vqs, vqs_info, &desc);
+ 	if (ret < 0)
+ 		goto out;
+@@ -1525,7 +1562,7 @@ static const struct virtio_device_id id_table[] = {
+ 	{},
+ };
+ 
+-static const unsigned int feature_table[] = { VIRTIO_FS_F_NOTIFICATION };
++static const unsigned int feature_table[] = { VIRTIO_FS_F_NOTIFICATION, VIRTIO_FS_F_SYNC };
+ 
+ static struct virtio_driver virtio_fs_driver = {
+ 	.driver.name		= KBUILD_MODNAME,
+@@ -1781,6 +1818,86 @@ out:
+ 	return ret;
+ }
+ 
++/*
++ * Whether a request is worth a sync queue: one a task waits for, short. A sync, a lock wait or
++ * big I/O would hold the vCPU for long.
++ */
++static bool virtio_fs_sync_op(struct fuse_req *req)
++{
++	struct fuse_args *args = req->args;
++
++	if (test_bit(FR_BACKGROUND, &req->flags) || !test_bit(FR_ISREPLY, &req->flags))
++		return false;
++
++	switch (req->in.h.opcode) {
++	case FUSE_FSYNC:
++	case FUSE_FSYNCDIR:
++	case FUSE_SYNCFS:
++	case FUSE_FALLOCATE:
++	case FUSE_COPY_FILE_RANGE:
++	case FUSE_COPY_FILE_RANGE_64:
++	case FUSE_SETLKW:
++		return false;
++	}
++
++	return req->in.h.len + fuse_len_args(args->out_numargs, args->out_args) <= SZ_128K;
++}
++
++/*
++ * Sends a request on this CPU's sync queue and has the host serve it in a hypercall, then ends
++ * it here: no interrupt, no worker, no wakeup. False to send it on a request queue instead.
++ */
++static bool virtio_fs_send_sync(struct virtio_fs *fs, struct fuse_req *req)
++{
++	struct virtio_fs_vq *fsvq;
++	struct arm_smccc_res res;
++	struct fuse_pqueue *fpq;
++	struct fuse_req *done;
++	unsigned int cpu, qid, len;
++
++	if (!virtio_fs_sync_op(req))
++		return false;
++
++	/* The queue is this CPU's until the request is back */
++	cpu = get_cpu();
++	if (cpu >= fs->num_sync_queues) {
++		put_cpu();
++		return false;
++	}
++
++	qid = fs->sync_vq + cpu;
++	fsvq = &fs->vqs[qid];
++	if (virtio_fs_enqueue_req(fsvq, req, false, GFP_ATOMIC) < 0) {
++		put_cpu();
++		return false;
++	}
++
++	arm_smccc_1_1_hvc(VIRTIO_FS_HVC_SYNC, fs->mmio_base, qid, &res);
++	spin_lock(&fsvq->lock);
++	done = virtqueue_get_buf(fsvq->vq, &len);
++	spin_unlock(&fsvq->lock);
++	put_cpu();
++
++	if (done != req) {
++		/* The host didn't serve it: no more sync queues, and the request fails */
++		pr_err_once("virtio-fs: sync queue %u not served (%ld)\n", qid, (long)res.a0);
++		fs->sync_vq = 0;
++		len = 0;
++	}
++
++	if (!virtio_fs_verify_response(req, len)) {
++		req->out.h.error = -EIO;
++		req->out.h.len = sizeof(struct fuse_out_header);
++	}
++
++	fpq = &fsvq->fud->pq;
++	spin_lock(&fpq->lock);
++	list_del_init(&req->list);
++	spin_unlock(&fpq->lock);
++	virtio_fs_request_complete(req, fsvq);
++	return true;
++}
++
+ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ {
+ 	unsigned int queue_id;
+@@ -1793,6 +1910,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 	clear_bit(FR_PENDING, &req->flags);
+ 
+ 	fs = fiq->priv;
++	if (fs->sync_vq && virtio_fs_send_sync(fs, req))
++		return;
++
+ 	queue_id = fs->mq_map[raw_smp_processor_id()];
+ 
+ 	pr_debug("%s: opcode %u unique %#llx nodeid %#llx in.len %u out.len %u queue_id %u\n",
+diff --git a/include/uapi/linux/virtio_fs.h b/include/uapi/linux/virtio_fs.h
+index 3156fd0..96f1daa 100644
+--- a/include/uapi/linux/virtio_fs.h
++++ b/include/uapi/linux/virtio_fs.h
+@@ -17,10 +17,18 @@ struct virtio_fs_config {
+ 
+ 	/* Size of each notification buffer, with VIRTIO_FS_F_NOTIFICATION */
+ 	__le32 notify_buf_size;
++
++	/* lodka: queues after the request ones, one per CPU, with VIRTIO_FS_F_SYNC */
++	__le32 num_sync_queues;
+ } __attribute__((packed));
+ 
+ /* The device sends FUSE notifications on virtqueue 1; the request queues follow it */
+ #define VIRTIO_FS_F_NOTIFICATION	0
++/*
++ * lodka: a request on a sync queue is served by the hypervisor in VIRTIO_FS_HVC_SYNC from the
++ * vCPU that sends it, done when the call returns
++ */
++#define VIRTIO_FS_F_SYNC		23
+ 
+ /*
+  * In a fuse_notify_inval_entry_out's flags: the name's contents changed, not the name, and the

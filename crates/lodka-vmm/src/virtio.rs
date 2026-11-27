@@ -352,12 +352,22 @@ pub trait Device: Send {
   fn config(&self) -> Vec<u8> {
     Vec::new()
   }
+  /// The features the driver took, told before `activate`.
+  fn negotiated(&mut self, _features: u64) {}
   /// The driver is ready: start serving the queues.
   fn activate(&mut self, mem: Arc<Mem>, queues: Vec<Queue>, irq: Irq) -> io::Result<()>;
   /// The driver made buffers available in `queue`. Runs on a vCPU thread, so it should only
   /// wake the device's own thread.
   fn notify(&mut self, queue: u16);
+  /// Queues a vCPU has served on its own thread by a hypercall, outside the transport's lock.
+  fn call(&self) -> Option<Call> {
+    None
+  }
 }
+
+/// Serves a device's queue now, on the vCPU that asks for it (`machine::HVC_QUEUE`): true if
+/// the queue is one the device serves so.
+pub type Call = Arc<dyn Fn(u16) -> bool + Send + Sync>;
 
 pub struct Transport {
   dev: Box<dyn Device>,
@@ -433,6 +443,7 @@ impl Transport {
     }
 
     (self.active, self.started) = (true, true);
+    self.dev.negotiated(self.drv_features & self.features);
     let queues = self.queues.clone();
     if let Err(e) = self.dev.activate(self.mem.clone(), queues, self.irq.clone()) {
       eprintln!("lodka: virtio device {}: {e}", self.dev.kind());

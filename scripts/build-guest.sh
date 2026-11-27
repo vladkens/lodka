@@ -21,12 +21,25 @@ fi
 
 what=$2
 apk add -q --no-cache build-base linux-headers bc flex bison perl openssl-dev elfutils-dev xz \
-  diffutils findutils erofs-utils curl
+  diffutils findutils erofs-utils curl patch
+
+# guest/patches on the pristine sources: those applied last are taken back first, newest first,
+# so only the files they touch are built again. On a failure the sources are fetched again.
+patches() {
+  for p in $(ls -r .lodka-patches/*.patch 2>/dev/null); do patch -s -f -R -p1 <"$p" || return 1; done
+  rm -rf .lodka-patches
+  for p in /src/guest/patches/*.patch; do patch -s -f -p1 <"$p" || return 1; done
+  cp -r /src/guest/patches .lodka-patches
+}
 
 kernel() {
   cd /build
   [ -f "linux-$KVER/Makefile" ] || curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz" | tar xJ
   cd "linux-$KVER"
+  if ! diff -rq /src/guest/patches .lodka-patches >/dev/null 2>&1 && ! patches; then
+    cd .. && rm -rf "linux-$KVER"
+    echo "guest/patches: one does not apply to $KVER" >&2 && exit 1
+  fi
   make -s allnoconfig KCONFIG_ALLCONFIG=/src/guest/kernel.config
   missing=0
   for line in $(grep -E '^CONFIG_[A-Z0-9_]+=y' /src/guest/kernel.config); do

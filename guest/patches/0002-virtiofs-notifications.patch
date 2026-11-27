@@ -1,0 +1,459 @@
+virtiofs: the notification queue, with inotify for what the host changes
+
+The virtio spec's VIRTIO_FS_F_NOTIFICATION, which Linux never took: virtqueue 1 holds buffers
+the device fills with FUSE notifications, the request queues follow it. lodka sends them for
+what changed on the Mac (FSEvents): INVAL_INODE for a file's contents or attributes,
+INVAL_ENTRY for a name made, DELETE for a name removed, INC_EPOCH when it lost track. Each drops
+what the guest cached, as the /dev/fuse notifications do, and tells fsnotify, so inotify
+watchers in the guest see changes made on the Mac. The guest can then cache names and
+attributes for long.
+
+Two flags of lodka's own. VIRTIO_FS_INVAL_MODIFIED on an INVAL_ENTRY, for a file the guest
+never looked up whose contents changed, has the guest look it up if inotify watches its
+directory, and tell inotify. FOPEN_INVAL_ATTR on an open, for a file changed since the guest
+last got its attributes, has them fetched there: a notification still on its way would leave
+the old size, and a splice reads up to it.
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index dc61efd..ae0921c 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -286,6 +286,11 @@ static int fuse_open(struct inode *inode, struct file *file)
+ 	if (is_wb_truncate || dax_truncate)
+ 		fuse_release_nowrite(inode);
+ 	if (!err) {
++		/* Now: a splice or an mmap reads up to the cached size, never asking */
++		if (ff->open_flags & FOPEN_INVAL_ATTR) {
++			fuse_invalidate_attr(inode);
++			fuse_update_attributes(inode, file, STATX_BASIC_STATS);
++		}
+ 		if (is_truncate)
+ 			truncate_pagecache(inode, 0);
+ 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index c135d0d..5a56356 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -6,6 +6,9 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/dax.h>
++#include <linux/fsnotify.h>
++#include <linux/iversion.h>
++#include <linux/namei.h>
+ #include <linux/pci.h>
+ #include <linux/interrupt.h>
+ #include <linux/group_cpus.h>
+@@ -39,7 +42,8 @@ static struct kset *virtio_fs_kset;
+ 
+ enum {
+ 	VQ_HIPRIO,
+-	VQ_REQUEST
++	VQ_REQUEST,
++	VQ_NOTIFY
+ };
+ 
+ #define VQ_NAME_LEN	24
+@@ -69,6 +73,10 @@ struct virtio_fs {
+ 	struct virtio_fs_vq *vqs;
+ 	unsigned int nvqs;               /* number of virtqueues */
+ 	unsigned int num_request_queues; /* number of request queues */
++	unsigned int req_vq;             /* the first request queue */
++	unsigned int notify_vq;          /* the notification queue, 0 for none */
++	unsigned int notify_buf_size;
++	void *notify_bufs;
+ 	struct dax_device *dax_dev;
+ 
+ 	unsigned int *mq_map; /* index = cpu id, value = request vq id */
+@@ -199,6 +207,7 @@ static void virtio_fs_ktype_release(struct kobject *kobj)
+ 
+ 	kfree(vfs->mq_map);
+ 	kfree(vfs->vqs);
++	kfree(vfs->notify_bufs);
+ 	kfree(vfs);
+ }
+ 
+@@ -248,7 +257,7 @@ static ssize_t cpu_list_show(struct kobject *kobj,
+ 
+ 	qid = fsvq->vq->index;
+ 	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
+-		if (qid < VQ_REQUEST || (fs->mq_map[cpu] == qid)) {
++		if (qid < fs->req_vq || (fs->mq_map[cpu] == qid)) {
+ 			if (first)
+ 				ret = snprintf(buf + pos, size - pos, "%u", cpu);
+ 			else
+@@ -909,6 +918,226 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
+ 	spin_unlock(&fsvq->lock);
+ }
+ 
++/* Gives a notification buffer back to the device; called with fsvq->lock held */
++static void virtio_fs_notify_post(struct virtio_fs_vq *fsvq, void *buf,
++				  unsigned int size)
++{
++	struct scatterlist sg;
++
++	sg_init_one(&sg, buf, size);
++	if (virtqueue_add_inbuf(fsvq->vq, &sg, 1, buf, GFP_ATOMIC))
++		pr_warn_once("virtio-fs: no room for a notification buffer\n");
++}
++
++/*
++ * A file changed on the host: drop what the guest cached of it, and tell inotify. Contents
++ * (off >= 0) are a modification and a close after writing, attributes alone a change of them.
++ */
++static void virtio_fs_inval_inode(struct fuse_conn *fc,
++				  struct fuse_notify_inval_inode_out *o)
++{
++	__u32 mask = o->off < 0 ? FS_ATTRIB : FS_MODIFY;
++	struct dentry *dentry;
++	struct inode *inode;
++
++	if (fuse_reverse_inval_inode(fc, o->ino, o->off, o->len))
++		return;
++
++	inode = fuse_ilookup(fc, o->ino, NULL);
++	if (!inode)
++		return;
++
++	dentry = d_find_any_alias(inode);
++	if (dentry) {
++		fsnotify_dentry(dentry, mask);
++		if (mask == FS_MODIFY)
++			fsnotify_dentry(dentry, FS_CLOSE_WRITE);
++		dput(dentry);
++	} else {
++		fsnotify_inode(inode, mask);
++	}
++	iput(inode);
++}
++
++/*
++ * A file the guest never looked up was written on the host. inotify reports a change to a
++ * file in a watched directory only through the file's own dentry, so look it up if inotify
++ * watches the directory; else there is nothing to do.
++ */
++static void virtio_fs_modified(struct fuse_conn *fc, u64 parent, struct qstr *name)
++{
++	struct dentry *dir, *child;
++	struct inode *inode;
++
++	inode = fuse_ilookup(fc, parent, NULL);
++	if (!inode)
++		return;
++	dir = fsnotify_inode_watches_children(inode) ? d_find_any_alias(inode) : NULL;
++	iput(inode);
++	if (!dir)
++		return;
++
++	child = lookup_noperm_unlocked(name, dir);
++	if (!IS_ERR(child)) {
++		if (d_really_is_positive(child)) {
++			fsnotify_dentry(child, FS_MODIFY);
++			fsnotify_dentry(child, FS_CLOSE_WRITE);
++		}
++		dput(child);
++	}
++	dput(dir);
++}
++
++/*
++ * A name in a directory changed on the host: drop it and the directory's listing from the
++ * guest's caches, and tell inotify it was made (INVAL_ENTRY) or removed (DELETE).
++ */
++static void virtio_fs_inval_entry(struct fuse_conn *fc, int code, void *arg,
++				  unsigned int size)
++{
++	__u32 mask = FS_CREATE, namelen, flags = 0;
++	struct inode *dir, *inode;
++	u64 parent, child = 0;
++	unsigned int hdr;
++	struct qstr name;
++	char *s;
++
++	if (code == FUSE_NOTIFY_DELETE) {
++		struct fuse_notify_delete_out *o = arg;
++
++		hdr = sizeof(*o);
++		if (size < hdr)
++			return;
++		parent = o->parent;
++		child = o->child;
++		namelen = o->namelen;
++		mask = FS_DELETE;
++	} else {
++		struct fuse_notify_inval_entry_out *o = arg;
++
++		hdr = sizeof(*o);
++		if (size < hdr)
++			return;
++		parent = o->parent;
++		namelen = o->namelen;
++		flags = o->flags;
++	}
++
++	s = arg + hdr;
++	if (namelen > fc->name_max || size != hdr + namelen + 1 || s[namelen])
++		return;
++	name = (struct qstr)QSTR_INIT(s, namelen);
++
++	if (flags & VIRTIO_FS_INVAL_MODIFIED) {
++		virtio_fs_modified(fc, parent, &name);
++		return;
++	}
++
++	if (child) {
++		inode = fuse_ilookup(fc, child, NULL);
++		if (inode && S_ISDIR(inode->i_mode))
++			mask |= FS_ISDIR;
++		iput(inode);
++	}
++
++	fuse_reverse_inval_entry(fc, parent, child, &name, flags);
++	dir = fuse_ilookup(fc, parent, NULL);
++	if (!dir)
++		return;
++
++	/* The listing changed, whether or not the guest has the name cached */
++	fuse_invalidate_attr(dir);
++	inode_maybe_inc_iversion(dir, false);
++	fsnotify_name(mask, dir, FSNOTIFY_EVENT_INODE, dir, &name, 0);
++	iput(dir);
++}
++
++static void virtio_fs_notify(struct fuse_conn *fc, void *buf, unsigned int len)
++{
++	struct fuse_out_header *oh = buf;
++
++	if (len < sizeof(*oh) || oh->len != len || oh->unique) {
++		pr_warn_ratelimited("virtio-fs: bad notification (%u bytes)\n", len);
++		return;
++	}
++
++	len -= sizeof(*oh);
++	down_read(&fc->killsb);
++	switch (oh->error) {
++	case FUSE_NOTIFY_INVAL_INODE:
++		if (len == sizeof(struct fuse_notify_inval_inode_out))
++			virtio_fs_inval_inode(fc, (void *)(oh + 1));
++		break;
++	case FUSE_NOTIFY_INVAL_ENTRY:
++	case FUSE_NOTIFY_DELETE:
++		virtio_fs_inval_entry(fc, oh->error, oh + 1, len);
++		break;
++	case FUSE_NOTIFY_INC_EPOCH:
++		/* Lost track: every cached name is looked up again */
++		atomic_inc(&fc->epoch);
++		break;
++	}
++	up_read(&fc->killsb);
++}
++
++/* Work function for the notification queue: handle each, give its buffer back */
++static void virtio_fs_notify_done_work(struct work_struct *work)
++{
++	struct virtio_fs_vq *fsvq = container_of(work, struct virtio_fs_vq,
++						 done_work);
++	struct virtqueue *vq = fsvq->vq;
++	struct virtio_fs *fs = vq->vdev->priv;
++	struct fuse_conn *fc;
++	unsigned int len;
++	void *buf;
++
++	spin_lock(&fsvq->lock);
++	do {
++		virtqueue_disable_cb(vq);
++
++		while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
++			fc = NULL;
++			if (fsvq->connected && fsvq->fud && fsvq->fud->fc)
++				fc = fuse_conn_get(fsvq->fud->fc);
++			spin_unlock(&fsvq->lock);
++
++			if (fc) {
++				virtio_fs_notify(fc, buf, min(len, fs->notify_buf_size));
++				fuse_conn_put(fc);
++			}
++
++			spin_lock(&fsvq->lock);
++			virtio_fs_notify_post(fsvq, buf, fs->notify_buf_size);
++		}
++	} while (!virtqueue_enable_cb(vq));
++	virtqueue_kick(vq);
++	spin_unlock(&fsvq->lock);
++}
++
++/* Fills the notification queue with buffers, once the device is ready */
++static int virtio_fs_notify_start(struct virtio_fs *fs)
++{
++	struct virtio_fs_vq *fsvq;
++	unsigned int i, n;
++
++	if (!fs->notify_vq)
++		return 0;
++
++	fsvq = &fs->vqs[fs->notify_vq];
++	n = virtqueue_get_vring_size(fsvq->vq);
++	fs->notify_bufs = kcalloc(n, fs->notify_buf_size, GFP_KERNEL);
++	if (!fs->notify_bufs)
++		return -ENOMEM;
++
++	spin_lock(&fsvq->lock);
++	for (i = 0; i < n; i++)
++		virtio_fs_notify_post(fsvq, fs->notify_bufs + i * fs->notify_buf_size,
++				      fs->notify_buf_size);
++	virtqueue_kick(fsvq->vq);
++	spin_unlock(&fsvq->lock);
++	return 0;
++}
++
+ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *fs)
+ {
+ 	const struct cpumask *mask, *masks;
+@@ -921,12 +1150,12 @@ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *f
+ 		goto fallback;
+ 
+ 	for (q = 0; q < fs->num_request_queues; q++) {
+-		mask = vdev->config->get_vq_affinity(vdev, VQ_REQUEST + q);
++		mask = vdev->config->get_vq_affinity(vdev, fs->req_vq + q);
+ 		if (!mask)
+ 			goto fallback;
+ 
+ 		for_each_cpu(cpu, mask)
+-			fs->mq_map[cpu] = q + VQ_REQUEST;
++			fs->mq_map[cpu] = q + fs->req_vq;
+ 	}
+ 
+ 	return;
+@@ -936,13 +1165,13 @@ fallback:
+ 	/* If even this fails we default to all CPUs use first request queue */
+ 	if (!masks) {
+ 		for_each_possible_cpu(cpu)
+-			fs->mq_map[cpu] = VQ_REQUEST;
++			fs->mq_map[cpu] = fs->req_vq;
+ 		return;
+ 	}
+ 
+ 	for (q = 0; q < fs->num_request_queues; q++) {
+ 		for_each_cpu(cpu, &masks[q % nr_masks])
+-			fs->mq_map[cpu] = q + VQ_REQUEST;
++			fs->mq_map[cpu] = q + fs->req_vq;
+ 	}
+ 	kfree(masks);
+ }
+@@ -970,6 +1199,10 @@ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
+ 		INIT_WORK(&fsvq->done_work, virtio_fs_requests_done_work);
+ 		INIT_WORK(&fsvq->dispatch_work,
+ 				virtio_fs_request_dispatch_work);
++	} else if (vq_type == VQ_NOTIFY) {
++		INIT_WORK(&fsvq->done_work, virtio_fs_notify_done_work);
++		INIT_WORK(&fsvq->dispatch_work,
++				virtio_fs_hiprio_dispatch_work);
+ 	} else {
+ 		INIT_WORK(&fsvq->done_work, virtio_fs_hiprio_done_work);
+ 		INIT_WORK(&fsvq->dispatch_work,
+@@ -999,7 +1232,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 	/* Truncate nr of request queues to nr_cpu_id */
+ 	fs->num_request_queues = min_t(unsigned int, fs->num_request_queues,
+ 					nr_cpu_ids);
+-	fs->nvqs = VQ_REQUEST + fs->num_request_queues;
++	fs->req_vq = VQ_REQUEST;
++	if (virtio_has_feature(vdev, VIRTIO_FS_F_NOTIFICATION)) {
++		virtio_cread_le(vdev, struct virtio_fs_config, notify_buf_size,
++				&fs->notify_buf_size);
++		if (fs->notify_buf_size < sizeof(struct fuse_out_header) ||
++		    fs->notify_buf_size > PAGE_SIZE)
++			return -EINVAL;
++		fs->notify_vq = fs->req_vq++;
++	}
++	desc.pre_vectors = fs->req_vq;
++	fs->nvqs = fs->req_vq + fs->num_request_queues;
+ 	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
+ 	if (!fs->vqs)
+ 		return -ENOMEM;
+@@ -1018,11 +1261,18 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+ 	virtio_fs_init_vq(&fs->vqs[VQ_HIPRIO], "hiprio", VQ_HIPRIO);
+ 	vqs_info[VQ_HIPRIO].name = fs->vqs[VQ_HIPRIO].name;
+ 
++	if (fs->notify_vq) {
++		i = fs->notify_vq;
++		vqs_info[i].callback = virtio_fs_vq_done;
++		virtio_fs_init_vq(&fs->vqs[i], "notifications", VQ_NOTIFY);
++		vqs_info[i].name = fs->vqs[i].name;
++	}
++
+ 	/* Initialize the requests virtqueues */
+-	for (i = VQ_REQUEST; i < fs->nvqs; i++) {
++	for (i = fs->req_vq; i < fs->nvqs; i++) {
+ 		char vq_name[VQ_NAME_LEN];
+ 
+-		snprintf(vq_name, VQ_NAME_LEN, "requests.%u", i - VQ_REQUEST);
++		snprintf(vq_name, VQ_NAME_LEN, "requests.%u", i - fs->req_vq);
+ 		virtio_fs_init_vq(&fs->vqs[i], vq_name, VQ_REQUEST);
+ 		vqs_info[i].callback = virtio_fs_vq_done;
+ 		vqs_info[i].name = fs->vqs[i].name;
+@@ -1200,6 +1450,10 @@ static int virtio_fs_probe(struct virtio_device *vdev)
+ 	 */
+ 	virtio_device_ready(vdev);
+ 
++	ret = virtio_fs_notify_start(fs);
++	if (ret < 0)
++		goto out_vqs;
++
+ 	ret = virtio_fs_add_instance(vdev, fs);
+ 	if (ret < 0)
+ 		goto out_vqs;
+@@ -1271,7 +1525,7 @@ static const struct virtio_device_id id_table[] = {
+ 	{},
+ };
+ 
+-static const unsigned int feature_table[] = {};
++static const unsigned int feature_table[] = { VIRTIO_FS_F_NOTIFICATION };
+ 
+ static struct virtio_driver virtio_fs_driver = {
+ 	.driver.name		= KBUILD_MODNAME,
+@@ -1738,7 +1992,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+ 	mutex_lock(&virtio_fs_mutex);
+ 	fs = virtio_fs_find_instance(fsc->source);
+ 	if (fs)
+-		virtqueue_size = virtqueue_get_vring_size(fs->vqs[VQ_REQUEST].vq);
++		virtqueue_size = virtqueue_get_vring_size(fs->vqs[fs->req_vq].vq);
+ 	mutex_unlock(&virtio_fs_mutex);
+ 
+ 	if (!fs) {
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index c13e1f9..4729fc2 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -392,6 +392,8 @@ struct fuse_file_lock {
+ #define FOPEN_NOFLUSH		(1 << 5)
+ #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
+ #define FOPEN_PASSTHROUGH	(1 << 7)
++/* lodka: the file changed since the guest was told its attributes; get them again */
++#define FOPEN_INVAL_ATTR	(1U << 31)
+ 
+ /**
+  * INIT request/reply flags
+diff --git a/include/uapi/linux/virtio_fs.h b/include/uapi/linux/virtio_fs.h
+index bea3829..3156fd0 100644
+--- a/include/uapi/linux/virtio_fs.h
++++ b/include/uapi/linux/virtio_fs.h
+@@ -14,8 +14,20 @@ struct virtio_fs_config {
+ 
+ 	/* Number of request queues */
+ 	__le32 num_request_queues;
++
++	/* Size of each notification buffer, with VIRTIO_FS_F_NOTIFICATION */
++	__le32 notify_buf_size;
+ } __attribute__((packed));
+ 
++/* The device sends FUSE notifications on virtqueue 1; the request queues follow it */
++#define VIRTIO_FS_F_NOTIFICATION	0
++
++/*
++ * In a fuse_notify_inval_entry_out's flags: the name's contents changed, not the name, and the
++ * guest has no inode for it; only inotify is told, if it watches the directory
++ */
++#define VIRTIO_FS_INVAL_MODIFIED	(1U << 31)
++
+ /* For the id field in virtio_pci_shm_cap */
+ #define VIRTIO_FS_SHMCAP_ID_CACHE 0
+ 
