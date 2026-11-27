@@ -2,7 +2,7 @@
 //! The commands a person runs: start, stop, status, ssh, delete. The VM runs in its own process
 //! (`lodka _vm`), which holds a lock on its pid file as long as it runs.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -179,22 +179,26 @@ pub fn delete(force: bool) -> io::Result<()> {
     stop(false)?;
   }
 
-  // Under the disk's lock, which a VM holds whatever its other folders: one started now would run
-  // on a deleted disk. Only lodka's files: the folder may be the state's too.
-  let disk = match File::open(dirs::disk_file()) {
-    Ok(x) => Some(x),
-    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+  // Under the disk's lock, which a VM holds whatever its other folders. Opened as the VM opens
+  // it, so one that makes the disk now waits too; removed last, after the key the VM makes once
+  // it has the disk. Only lodka's files: the folder may be the state's too.
+  let path = dirs::disk_file();
+  let disk = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path);
+  let disk = match disk {
+    Ok(x) => x,
+    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+      println!("lodka: no VM to delete"); // no folder: no VM made one
+      return Ok(());
+    }
     Err(e) => return Err(e),
   };
 
-  if let Some(f) = &disk
-    && !dirs::lock_disk(f)?
-  {
+  if !dirs::lock_disk(&disk)? {
     return Err(bad("delete: a VM uses the disk"));
   }
 
   let key = dirs::key_file();
-  for x in [dirs::disk_file(), key.with_extension("pub"), key] {
+  for x in [key.with_extension("pub"), key, path] {
     match fs::remove_file(x) {
       Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
       _ => {}
