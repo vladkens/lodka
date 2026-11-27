@@ -12,8 +12,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::bad;
 use crate::dirs::{self, GIB, Settings, mkdir, running};
+use crate::{bad, context};
 
 const START_WAIT: Duration = Duration::from_secs(120);
 const STOP_WAIT: Duration = Duration::from_secs(30);
@@ -66,7 +66,15 @@ pub fn start(cpus: Option<u32>, memory: Option<u32>, disk: Option<u32>) -> io::R
 
     if docker_ping() {
       println!("lodka: running in {:.1}s", t0.elapsed().as_secs_f32());
-      println!("export DOCKER_HOST=unix://{}", dirs::docker_sock().display());
+      let sock = dirs::docker_sock();
+      match context::add(&sock) {
+        Ok(()) => println!("docker context use {}", context::NAME),
+        Err(e) => {
+          eprintln!("lodka: docker context: {e}");
+          println!("export DOCKER_HOST=unix://{}", sock.display());
+        }
+      }
+
       return Ok(());
     }
 
