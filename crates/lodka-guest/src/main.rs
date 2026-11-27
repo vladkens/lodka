@@ -153,7 +153,7 @@ fn var() -> io::Result<()> {
 
 /// The Mac's folders lodka shares, each at the path its tag names (`/Users`): virtio-fs devices
 /// list their tags in sysfs. Each file shows whoever asks as its owner, and macOS checks access
-/// as the Mac user (`caller_owns`, guest/patches).
+/// as the Mac user (`caller_owns`, guest/patches); no setuid file there runs as root.
 fn shares() {
   let Ok(dirs) = fs::read_dir("/sys/fs/virtiofs") else { return };
   for x in dirs.flatten() {
@@ -163,7 +163,7 @@ fn shares() {
       continue;
     }
 
-    if let Err(e) = mount(tag, tag, "virtiofs", NODEV, "caller_owns") {
+    if let Err(e) = mount(tag, tag, "virtiofs", NOSUID | NODEV, "caller_owns") {
       log!("{tag}: {e}");
     }
   }

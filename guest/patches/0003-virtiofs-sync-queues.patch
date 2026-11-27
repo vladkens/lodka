@@ -4,10 +4,12 @@ A request a task waits for goes on its CPU's sync queue, and an HVC (VIRTIO_FS_H
 vendor hypervisor call) has lodka serve that queue on the vCPU's own thread before it returns;
 the request ends right there. No device thread to wake, no interrupt, no kworker, no wakeup of
 the waiting task: a LOOKUP or GETATTR costs one exit to the host. Fsyncs, lock waits and I/O
-over 128 KiB stay on the request queues, served by threads, as they would hold the vCPU.
+over 128 KiB stay on the request queues, served by threads, as they would hold the vCPU; so
+does a request the device answers VIRTIO_FS_SYNC_AGAIN, one on a file it would have to
+download first.
 Prior art: libkrun's VIRTIO_FS_F_SYNC, with an MMIO notify in place of the HVC.
 diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
-index 5a56356..806a7f3 100644
+index 5a56356..3ca795a 100644
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
 @@ -5,11 +5,14 @@
@@ -105,7 +107,7 @@ index 5a56356..806a7f3 100644
  
  static struct virtio_driver virtio_fs_driver = {
  	.driver.name		= KBUILD_MODNAME,
-@@ -1781,6 +1818,86 @@ out:
+@@ -1781,6 +1818,101 @@ out:
  	return ret;
  }
  
@@ -169,6 +171,22 @@ index 5a56356..806a7f3 100644
 +	spin_unlock(&fsvq->lock);
 +	put_cpu();
 +
++	fpq = &fsvq->fud->pq;
++	if (done == req && len == sizeof(req->out.h) &&
++	    req->out.h.error == -VIRTIO_FS_SYNC_AGAIN) {
++		/* It would hold the vCPU: undo the sending, for a request queue */
++		spin_lock(&fpq->lock);
++		list_del_init(&req->list);
++		spin_unlock(&fpq->lock);
++		kfree(req->argbuf);
++		req->argbuf = NULL;
++		clear_bit(FR_SENT, &req->flags);
++		spin_lock(&fsvq->lock);
++		dec_in_flight_req(fsvq);
++		spin_unlock(&fsvq->lock);
++		return false;
++	}
++
 +	if (done != req) {
 +		/* The host didn't serve it: no more sync queues, and the request fails */
 +		pr_err_once("virtio-fs: sync queue %u not served (%ld)\n", qid, (long)res.a0);
@@ -181,7 +199,6 @@ index 5a56356..806a7f3 100644
 +		req->out.h.len = sizeof(struct fuse_out_header);
 +	}
 +
-+	fpq = &fsvq->fud->pq;
 +	spin_lock(&fpq->lock);
 +	list_del_init(&req->list);
 +	spin_unlock(&fpq->lock);
@@ -192,7 +209,7 @@ index 5a56356..806a7f3 100644
  static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
  {
  	unsigned int queue_id;
-@@ -1793,6 +1910,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+@@ -1793,6 +1925,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
  	clear_bit(FR_PENDING, &req->flags);
  
  	fs = fiq->priv;
@@ -203,10 +220,10 @@ index 5a56356..806a7f3 100644
  
  	pr_debug("%s: opcode %u unique %#llx nodeid %#llx in.len %u out.len %u queue_id %u\n",
 diff --git a/include/uapi/linux/virtio_fs.h b/include/uapi/linux/virtio_fs.h
-index 3156fd0..96f1daa 100644
+index 3156fd0..933d5c0 100644
 --- a/include/uapi/linux/virtio_fs.h
 +++ b/include/uapi/linux/virtio_fs.h
-@@ -17,10 +17,18 @@ struct virtio_fs_config {
+@@ -17,10 +17,23 @@ struct virtio_fs_config {
  
  	/* Size of each notification buffer, with VIRTIO_FS_F_NOTIFICATION */
  	__le32 notify_buf_size;
@@ -222,6 +239,11 @@ index 3156fd0..96f1daa 100644
 + * vCPU that sends it, done when the call returns
 + */
 +#define VIRTIO_FS_F_SYNC		23
++/*
++ * lodka: the error of a sync request the device won't serve on the vCPU, as it would wait long
++ * (a file still in the cloud); the driver sends it on a request queue
++ */
++#define VIRTIO_FS_SYNC_AGAIN		1024
  
  /*
   * In a fuse_notify_inval_entry_out's flags: the name's contents changed, not the name, and the

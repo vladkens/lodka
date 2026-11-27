@@ -30,8 +30,9 @@ const QUEUE: u16 = 1024;
 /// A sync queue holds one request of at most 128 KiB; the notification queue, the buffers the
 /// driver gives it.
 const SMALL: u16 = 128;
-/// The largest notification is an entry's, with a 255-byte name.
-const NOTE_SIZE: u32 = 512;
+/// A notification's buffer: the largest is an entry's, 33 bytes and a name of up to Linux's
+/// 1024 bytes.
+const NOTE_SIZE: u32 = 2048;
 /// Notifications waiting for the guest's buffers; past this many, the guest drops its whole
 /// cache of names instead.
 const NOTES: usize = 64 * 1024;
@@ -63,10 +64,12 @@ impl SyncQueues {
       return false;
     };
 
+    thread_local!(static NO_DOWNLOADS: () = mac::no_downloads());
+    NO_DOWNLOADS.with(|_| ());
     let mut q = q.lock().unwrap();
     let mut serve = || -> io::Result<()> {
       while let Some(chain) = q.pop(&self.mem)? {
-        let len = server.serve(&self.mem, &chain);
+        let len = server.serve_vcpu(&self.mem, &chain);
         q.push(&self.mem, chain.head, len)?;
       }
 
@@ -112,6 +115,8 @@ impl Notes {
         return Ok(used);
       };
 
+      // Too long for the buffer, if ever: the guest drops its whole cache instead.
+      let note = if note.len() > chain.write_len() { server::inc_epoch() } else { note };
       let n = chain.write_at(mem, 0, &note)?;
       q.push(mem, chain.head, n as u32)?;
       used = true;

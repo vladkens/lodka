@@ -23,14 +23,18 @@ use crate::virtio::Chain;
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
+const EEXIST: i32 = 17;
 const E2BIG: i32 = 7;
 const EINVAL: i32 = 22;
 const ERANGE: i32 = 34;
+const EDEADLK: i32 = 35;
 const ENAMETOOLONG: i32 = 36;
 const ENOSYS: i32 = 38;
 const ELOOP: i32 = 40;
 const ENODATA: i32 = 61;
 const ESTALE: i32 = 116;
+/// lodka's: the guest sends the request again on a request queue (guest/patches).
+const SYNC_AGAIN: i32 = 1024;
 
 /// How long the guest may trust a name, its absence and attributes without asking again: long
 /// while FSEvents tells it what changes on the Mac, else a second.
@@ -161,8 +165,7 @@ impl Server {
     }
 
     let path = path.strip_suffix(b"/").unwrap_or(path);
-    let Some(cut) = path.iter().rposition(|&x| x == b'/') else { return Vec::new() };
-    let (dir, name) = (&path[..cut.max(1)], &path[cut + 1..]);
+    let Some((dir, name)) = split(path) else { return Vec::new() };
     if name.is_empty() || path == self.root.as_bytes() {
       return Vec::new();
     }
@@ -205,6 +208,16 @@ impl Server {
 
   /// Serves one request; returns how many bytes of reply it wrote into the chain.
   pub fn serve(&self, mem: &Mem, chain: &Chain) -> u32 {
+    self.serve_on(mem, chain, false)
+  }
+
+  /// Serves one request on a vCPU's thread, which must not wait long: a file still in iCloud
+  /// is sent back to the guest for a request queue instead (VIRTIO_FS_SYNC_AGAIN).
+  pub fn serve_vcpu(&self, mem: &Mem, chain: &Chain) -> u32 {
+    self.serve_on(mem, chain, true)
+  }
+
+  fn serve_on(&self, mem: &Mem, chain: &Chain, vcpu: bool) -> u32 {
     let mut hdr = [0u8; size_of::<abi::InHeader>()];
     if chain.read_at(mem, 0, &mut hdr).ok() != Some(hdr.len()) {
       return 0;
@@ -224,7 +237,11 @@ impl Server {
     }
 
     let req = Req { h, args: &args, mem, chain };
-    let out = self.handle(&req);
+    let out = match self.handle(&req) {
+      Err(EDEADLK) if vcpu => Err(SYNC_AGAIN),
+      x => x,
+    };
+
     self.send(mem, chain, &h, out)
   }
 
@@ -416,7 +433,10 @@ impl Server {
       abi::OPENDIR => {
         let fd = self.open_node(id, libc::O_RDONLY | libc::O_DIRECTORY)?;
         let fh = self.add_handle(fd);
-        reply(&abi::OpenOut { fh, open_flags: abi::FOPEN_CACHE_DIR, ..Default::default() })
+        // Kept across opens while FSEvents tells the guest of changes, which bump its version.
+        let keep = if self.watched.load(Ordering::Relaxed) { abi::FOPEN_KEEP_CACHE } else { 0 };
+        let open_flags = abi::FOPEN_CACHE_DIR | keep;
+        reply(&abi::OpenOut { fh, open_flags, ..Default::default() })
       }
       abi::READDIR => self.readdir(r, false),
       abi::READDIRPLUS => self.readdir(r, true),
@@ -536,6 +556,15 @@ impl Server {
     self.nodes.lock().unwrap().ids.get(&id).copied().ok_or(ESTALE)
   }
 
+  /// `st` if it is the node's file: a path can lead elsewhere once renamed.
+  fn same(&self, id: u64, st: Stat) -> Result<Stat, i32> {
+    let n = self.node(id)?;
+    match (st.dev, st.ino) == (n.dev, n.ino) {
+      true => Ok(st),
+      false => Err(ESTALE),
+    }
+  }
+
   /// The guest looked `st` up once more: its node, made on the first lookup.
   fn add(&self, st: &Stat) -> u64 {
     let mut n = self.nodes.lock().unwrap();
@@ -592,14 +621,9 @@ impl Server {
     })
   }
 
-  /// Whether `fd` is the node's file: a path can lead elsewhere once renamed.
+  /// Whether `fd` is the node's file.
   fn check(&self, id: u64, fd: RawFd) -> Result<Stat, i32> {
-    let n = self.node(id)?;
-    let st = mac::fstat(fd).map_err(err)?;
-    match (st.dev, st.ino) == (n.dev, n.ino) {
-      true => Ok(st),
-      false => Err(ESTALE),
-    }
+    self.same(id, mac::fstat(fd).map_err(err)?)
   }
 
   /// The node's file opened, with `flags`.
@@ -629,17 +653,13 @@ impl Server {
   fn parent_of(&self, id: u64) -> Result<(OwnedFd, CString), i32> {
     let path = self.path(id)?;
     let bytes = path.as_bytes();
-    let cut = bytes.iter().rposition(|&x| x == b'/').ok_or(EINVAL)?;
-    let (parent, name) = (&bytes[..cut.max(1)], &bytes[cut + 1..]);
+    let (parent, name) = split(bytes).ok_or(EINVAL)?;
     let parent = CString::new(parent).map_err(|_| EINVAL)?;
     let name = CString::new(name).map_err(|_| EINVAL)?;
     let dir = open(&parent, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let (_, st) = mac::stat_at(dir.as_raw_fd(), &name).map_err(err)?;
-    let n = self.node(id)?;
-    match (st.dev, st.ino) == (n.dev, n.ino) {
-      true => Ok((dir, name)),
-      false => Err(ESTALE),
-    }
+    self.same(id, st)?;
+    Ok((dir, name))
   }
 
   /// The node's attributes now.
@@ -649,11 +669,7 @@ impl Server {
       return mac::fstat(self.dir(id)?.as_raw_fd()).map_err(err);
     }
 
-    let st = mac::lstat(&self.path(id)?).map_err(err)?;
-    match (st.dev, st.ino) == (n.dev, n.ino) {
-      true => Ok(st),
-      false => Err(ESTALE),
-    }
+    self.same(id, mac::lstat(&self.path(id)?).map_err(err)?)
   }
 
   fn lookup(&self, parent: u64, name: &CStr) -> Res {
@@ -761,6 +777,11 @@ impl Server {
     let x: abi::CreateIn = arg(r.args, 0)?;
     let (name, _) = name(r.args, size_of::<abi::CreateIn>())?;
     let dir = self.dir(r.h.nodeid)?;
+    // Another spelling of the name would be opened, and maybe truncated, in its place.
+    if other_spelling(dir.as_raw_fd(), name).is_some() {
+      return Err(EEXIST);
+    }
+
     let flags = mac::open_flags(x.flags) | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: a NUL-terminated name in an open directory.
     let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, x.mode & 0o7777) };
@@ -845,7 +866,7 @@ impl Server {
   /// macOS clones only whole files into new ones, so this copies.
   fn copy(&self, x: &abi::CopyFileRangeIn) -> Result<u64, i32> {
     let (from, to) = (self.handle_fd(x.fh_in)?, self.handle_fd(x.fh_out)?);
-    let mut buf = vec![0u8; MAX_IO as usize];
+    let mut buf = vec![0u8; x.len.min(MAX_IO as u64) as usize];
     let mut done = 0;
     while done < x.len {
       let want = (x.len - done).min(buf.len() as u64) as usize;
@@ -952,6 +973,14 @@ impl Server {
     let bits = [(1, libc::RENAME_EXCL), (2, libc::RENAME_SWAP)];
     let f = bits.into_iter().filter(|&(l, _)| flags & l != 0).fold(0, |f, (_, m)| f | m);
     let (a, b) = (self.dir(from)?, self.dir(to)?);
+    // Another spelling of the new name would be replaced, unless it is the file renamed: a
+    // change of case.
+    if let Some(st) = other_spelling(b.as_raw_fd(), new)
+      && mac::stat_at(a.as_raw_fd(), old).map_or(true, |(_, x)| (x.dev, x.ino) != (st.dev, st.ino))
+    {
+      return Err(EEXIST);
+    }
+
     // SAFETY: NUL-terminated names in open directories.
     if unsafe { libc::renameatx_np(a.as_raw_fd(), old.as_ptr(), b.as_raw_fd(), new.as_ptr(), f) }
       != 0
@@ -1016,7 +1045,10 @@ impl Server {
   /// One attribute's value (`name`), or the list of names; with `size` 0, only how long it is.
   fn xattr_get(&self, id: u64, name: Option<&CStr>, size: u32) -> Res {
     let path = self.path(id)?;
-    let mut buf = vec![0u8; if size == 0 { 64 * 1024 } else { size as usize }];
+    // A list goes into a full buffer: it has the com.apple.* names, which the guest's size
+    // doesn't count.
+    let full = size == 0 || name.is_none();
+    let mut buf = vec![0u8; if full { 64 * 1024 } else { size as usize }];
     // SAFETY: the calls write at most the buffer's size; the strings are NUL-terminated.
     let n = unsafe {
       match name {
@@ -1035,7 +1067,7 @@ impl Server {
     };
     if n < 0 {
       return Err(match os() {
-        ERANGE if size == 0 => E2BIG, // with no size given: longer than Linux allows
+        ERANGE if full => E2BIG, // longer than Linux allows
         x => x,
       });
     }
@@ -1100,6 +1132,21 @@ fn note(code: i32, parts: &[&[u8]]) -> Vec<u8> {
 /// Every name the guest cached is looked up again: for when changes went unseen.
 pub fn inc_epoch() -> Vec<u8> {
   note(abi::NOTIFY_INC_EPOCH, &[])
+}
+
+/// The file `name` finds in `dir` when it is stored under another spelling: a case- or
+/// normalization-insensitive volume would open or replace it for `name`.
+fn other_spelling(dir: RawFd, name: &CStr) -> Option<Stat> {
+  match mac::stat_at(dir, name) {
+    Ok((stored, st)) if stored != name.to_bytes() => Some(st),
+    _ => None,
+  }
+}
+
+/// A path's directory and name: `/a/b` is `/a` and `b`, `/a` is `/` and `a`.
+fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
+  let cut = path.iter().rposition(|&x| x == b'/')?;
+  Some((&path[..cut.max(1)], &path[cut + 1..]))
 }
 
 fn lstat(path: &[u8]) -> Option<Stat> {
@@ -1379,6 +1426,12 @@ mod tests {
     assert_eq!(t.lookup(abi::ROOT_ID, "readme.md").unwrap_err(), ENOENT);
     assert_eq!(t.lookup(abi::ROOT_ID, "nope").unwrap_err(), ENOENT);
     assert_eq!(t.lookup(abi::ROOT_ID, "..").unwrap_err(), EINVAL);
+
+    // The longest names APFS takes, 255 characters of 3 bytes each.
+    let long = "語".repeat(255);
+    std::fs::write(t.dir.join(&long), b"").unwrap();
+    assert!(t.lookup(abi::ROOT_ID, &long).is_ok());
+
     // The same file gets the same node; forgotten as often as looked up, it goes.
     let again = t.lookup(abi::ROOT_ID, "README.md").unwrap();
     assert_eq!(again.nodeid, e.nodeid);
@@ -1408,6 +1461,16 @@ mod tests {
       t.call(abi::RENAME, abi::ROOT_ID, &cat(&[abi::bytes(&rn), &z("a.txt"), &z("A.txt")]), 0);
     assert_eq!(e, 0);
     assert_eq!(t.lookup(abi::ROOT_ID, "A.txt").unwrap().nodeid, entry.nodeid);
+    assert_eq!(std::fs::read(t.dir.join("A.txt")).unwrap(), b"hello");
+
+    // a.txt is A.txt on this volume: neither made over it nor moved onto it.
+    let c = abi::CreateIn { flags: 0o1002, mode: 0o100644, ..Default::default() }; // O_TRUNC
+    let (e, _) = t.call(abi::CREATE, abi::ROOT_ID, &cat(&[abi::bytes(&c), &z("a.txt")]), 256);
+    assert_eq!(e, -EEXIST);
+    std::fs::write(t.dir.join("b"), b"").unwrap();
+    let (e, _) =
+      t.call(abi::RENAME, abi::ROOT_ID, &cat(&[abi::bytes(&rn), &z("b"), &z("a.txt")]), 0);
+    assert_eq!(e, -EEXIST);
     assert_eq!(std::fs::read(t.dir.join("A.txt")).unwrap(), b"hello");
 
     let ga = abi::GetattrIn::default();
@@ -1508,9 +1571,14 @@ mod tests {
       libc::setxattr(p.as_ptr(), c"com.apple.test".as_ptr(), b"x".as_ptr().cast(), 1, 0, 0)
     };
 
-    let gx = abi::GetxattrIn { size: 100, padding: 0 };
+    // The size the guest is told, then a list of that size.
+    let gx = abi::GetxattrIn { size: 0, padding: 0 };
+    let (e, b) = t.call(abi::LISTXATTR, f.nodeid, abi::bytes(&gx), 100);
+    assert_eq!((e, abi::read::<abi::GetxattrOut>(&b).unwrap().size), (0, 7));
+    let gx = abi::GetxattrIn { size: 7, padding: 0 };
     let (e, b) = t.call(abi::LISTXATTR, f.nodeid, abi::bytes(&gx), 100);
     assert_eq!((e, b.as_slice()), (0, &b"user.a\0"[..]));
+    let gx = abi::GetxattrIn { size: 100, padding: 0 };
     let (e, b) = t.call(abi::GETXATTR, f.nodeid, &cat(&[abi::bytes(&gx), &z("user.a")]), 100);
     assert_eq!((e, b.as_slice()), (0, &b"abc"[..]));
     let (e, _) =

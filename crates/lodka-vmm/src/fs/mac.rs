@@ -128,7 +128,10 @@ fn attrlist(bulk: bool) -> libc::attrlist {
 /// to, with the name as stored: on a case-insensitive volume `readme.md` finds `README.md`.
 pub fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Entry> {
   let al = attrlist(false);
-  let mut buf = [0u64; 64]; // 512 bytes, aligned
+  // Aligned, and room for the fixed attributes and the longest name: 255 UTF-16 units, each
+  // up to 3 bytes of UTF-8.
+  let mut buf = [0u64; 256];
+  let size = size_of_val(&buf);
   let opts = libc::FSOPT_NOFOLLOW as u64;
   // SAFETY: getattrlistat writes at most the buffer's size into it.
   let r = unsafe {
@@ -137,7 +140,7 @@ pub fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Entry> {
       name.as_ptr(),
       (&al as *const libc::attrlist).cast_mut().cast(),
       buf.as_mut_ptr().cast(),
-      512,
+      size,
       opts,
     )
   };
@@ -146,7 +149,7 @@ pub fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Entry> {
   }
 
   // SAFETY: a u64 buffer seen as its bytes.
-  let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), 512) };
+  let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), size) };
   parse(bytes)
 }
 
@@ -359,6 +362,17 @@ impl Reader<'_> {
 unsafe extern "C" {
   /// sys/fsgetpath.h: a path of the file with inode `obj_id` on the volume `fsid`.
   fn fsgetpath(buf: *mut libc::c_char, size: usize, fsid: *mut [i32; 2], obj_id: u64) -> isize;
+  /// sys/resource.h.
+  fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+}
+
+/// Has the calling thread fail with EDEADLK where it would wait for a dataless file, one
+/// evicted to iCloud, to download; other threads still wait.
+pub fn no_downloads() {
+  // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
+  // IOPOL_MATERIALIZE_DATALESS_FILES_OFF.
+  // SAFETY: sets a policy of this thread.
+  unsafe { setiopolicy_np(3, 1, 1) };
 }
 
 /// A path to the file `ino` on the volume `dev`: of a hard-linked file, any of its names.
@@ -382,7 +396,8 @@ pub fn path(dev: i32, ino: u64) -> io::Result<CString> {
 pub fn errno(e: &io::Error) -> i32 {
   let Some(x) = e.raw_os_error() else { return 5 };
   match x {
-    1..=34 => x, // EPERM to ERANGE: the same numbers
+    libc::EDEADLK => 35,
+    1..=34 => x, // EPERM to ERANGE: the same numbers but EDEADLK
     libc::EAGAIN => 11,
     libc::EINPROGRESS => 115,
     libc::EALREADY => 114,
@@ -515,6 +530,7 @@ mod tests {
   fn linux_numbers() {
     assert_eq!(errno(&io::Error::from_raw_os_error(libc::ENOTEMPTY)), 39);
     assert_eq!(errno(&io::Error::from_raw_os_error(libc::ENOENT)), 2);
+    assert_eq!(errno(&io::Error::from_raw_os_error(libc::EDEADLK)), 35);
     assert_eq!(open_flags(0o1002), libc::O_RDWR | libc::O_TRUNC);
     assert_eq!(open_flags(0o2001), libc::O_WRONLY | libc::O_APPEND);
   }
