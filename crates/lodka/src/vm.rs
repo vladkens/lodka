@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use std::{env, thread};
 
 use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT, FORWARD_PORT};
+use lodka_vmm::balloon::Balloon;
 use lodka_vmm::blk::Blk;
 use lodka_vmm::console::{Console, Rng};
 use lodka_vmm::fs::Fs;
@@ -65,6 +66,9 @@ pub fn serve() -> io::Result<()> {
 
   let mut cmdline =
     "console=hvc0 root=/dev/vda ro rootfstype=erofs init=/sbin/lodka-guest panic=-1".to_string();
+  // Freed memory reported in blocks from 16 KiB, the Mac's page, up: the 2 MiB default leaves
+  // page cache freed page by page in the guest.
+  cmdline += " page_reporting.page_reporting_order=2";
   match env::var_os("LODKA_DEBUG") {
     Some(_) => cmdline += " earlycon=pl011,0x09000000 loglevel=7",
     None => cmdline += " quiet",
@@ -117,6 +121,8 @@ pub fn serve() -> io::Result<()> {
   m.add(Box::new(vsock));
   // The Mac user's folders at the same path, so `docker run -v "$PWD:/app"` works from them.
   m.add(Box::new(Fs::new("/Users", Path::new("/Users"), queues)?));
+  // What the guest frees goes back to the Mac.
+  m.add(Box::new(Balloon::new()?));
 
   *ctl.ports.lock().unwrap() = Some(Ports::new(dial(conn.clone())));
   docker(conn)?;
