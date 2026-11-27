@@ -190,10 +190,14 @@ fn forward(mut x: UnixStream) -> io::Result<()> {
   let mut line = Vec::new();
   let mut b = [0u8; 1];
   // A byte at a time: what follows the line is the connection's own data.
-  while line.len() < "[::1]:65535".len() {
+  loop {
     x.read_exact(&mut b)?;
     if b[0] == b'\n' {
       break;
+    }
+
+    if line.len() == "127.0.0.1:65535".len() {
+      return Err(io::Error::other("forward: the address line is too long"));
     }
 
     line.push(b[0]);
