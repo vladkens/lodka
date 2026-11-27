@@ -409,7 +409,10 @@ impl Server {
         };
         reply(&abi::StatfsOut { st })
       }
-      abi::FLUSH | abi::SYNCFS => Ok(Out::Bytes(Vec::new())),
+      // Writes reach the file at once, so a close has nothing to flush: ENOSYS, and the guest
+      // sends no more FLUSHes.
+      abi::FLUSH => Err(ENOSYS),
+      abi::SYNCFS => Ok(Out::Bytes(Vec::new())),
       abi::RELEASE | abi::RELEASEDIR => {
         let x: abi::ReleaseIn = arg(r.args, 0)?;
         self.handles.lock().unwrap().remove(&x.fh);
