@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{io, thread};
 
-/// Opens a stream to a TCP port in the guest.
-pub type Dial = Arc<dyn Fn(u16) -> io::Result<UnixStream> + Send + Sync>;
+/// Opens a stream to the guest's TCP port for a connection to this address on the Mac.
+pub type Dial = Arc<dyn Fn(SocketAddr) -> io::Result<UnixStream> + Send + Sync>;
 
 /// How often a relay looks again at the Unix socket it reads: under load, macOS now and then
 /// doesn't wake a blocked reader when the other end writes or shuts down.
@@ -68,9 +68,9 @@ impl Fwd {
   fn open(addr: SocketAddr, dial: &Dial) -> io::Result<Fwd> {
     let l = TcpListener::bind(addr)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let (port, dial, s) = (addr.port(), dial.clone(), stop.clone());
-    let run = move || accept(l, port, &dial, &s);
-    thread::Builder::new().name(format!("port-{port}")).spawn(run)?;
+    let (dial, s) = (dial.clone(), stop.clone());
+    let run = move || accept(l, addr, &dial, &s);
+    thread::Builder::new().name(format!("port-{}", addr.port())).spawn(run)?;
     Ok(Fwd { stop, addr })
   }
 }
@@ -82,7 +82,7 @@ impl Drop for Fwd {
   }
 }
 
-fn accept(l: TcpListener, port: u16, dial: &Dial, stop: &AtomicBool) {
+fn accept(l: TcpListener, addr: SocketAddr, dial: &Dial, stop: &AtomicBool) {
   for x in l.incoming() {
     if stop.load(Ordering::Acquire) {
       return;
@@ -90,9 +90,9 @@ fn accept(l: TcpListener, port: u16, dial: &Dial, stop: &AtomicBool) {
 
     let Ok(x) = x else { continue };
     let dial = dial.clone();
-    thread::spawn(move || match dial(port) {
+    thread::spawn(move || match dial(addr) {
       Ok(y) => relay(x, y),
-      Err(e) => eprintln!("lodka: port {port}: {e}"),
+      Err(e) => eprintln!("lodka: port {addr}: {e}"),
     });
   }
 }
@@ -132,8 +132,10 @@ mod tests {
 
   #[test]
   fn forwards_and_closes() {
-    // The guest's side: echoes four bytes after a line with the port.
-    let dial: Dial = Arc::new(|_| {
+    // The guest's side: echoes four bytes.
+    let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let dial: Dial = Arc::new(move |addr| {
+      assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, free)));
       let (a, mut b) = UnixStream::pair()?;
       thread::spawn(move || {
         let mut buf = [0u8; 4];
@@ -144,7 +146,6 @@ mod tests {
       Ok(a)
     });
 
-    let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let mut ports = Ports::new(dial);
     ports.update(&[free]);
     let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();

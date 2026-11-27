@@ -183,13 +183,14 @@ fn docker(x: UnixStream) -> io::Result<()> {
   Ok(())
 }
 
-/// Joins a connection to the TCP port its first line names, on the loopback, where whatever
-/// listens on every address answers too.
+/// Joins a connection to the port of the Mac's address its first line names, on the guest's
+/// loopback of the same family first: a container that has only `[::]:8080` and another with
+/// only `0.0.0.0:8080` each get theirs. Whatever listens on every address answers there too.
 fn forward(mut x: UnixStream) -> io::Result<()> {
   let mut line = Vec::new();
   let mut b = [0u8; 1];
   // A byte at a time: what follows the line is the connection's own data.
-  while line.len() < 6 {
+  while line.len() < "[::1]:65535".len() {
     x.read_exact(&mut b)?;
     if b[0] == b'\n' {
       break;
@@ -198,11 +199,14 @@ fn forward(mut x: UnixStream) -> io::Result<()> {
     line.push(b[0]);
   }
 
-  let port: u16 = std::str::from_utf8(&line)
+  let addr: SocketAddr = std::str::from_utf8(&line)
     .ok()
     .and_then(|x| x.parse().ok())
-    .ok_or_else(|| io::Error::other(format!("forward: bad port {line:?}")))?;
-  let to = [SocketAddr::from((Ipv4Addr::LOCALHOST, port)), (Ipv6Addr::LOCALHOST, port).into()];
+    .ok_or_else(|| io::Error::other(format!("forward: bad address {line:?}")))?;
+  let port = addr.port();
+  let (v4, v6) =
+    (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), (Ipv6Addr::LOCALHOST, port).into());
+  let to = if addr.is_ipv6() { [v6, v4] } else { [v4, v6] };
   let tcp = TcpStream::connect(&to[..])?;
   tcp.set_nodelay(true)?;
   // As the vsock streams: a UnixStream only reads, writes and shuts down its descriptor.

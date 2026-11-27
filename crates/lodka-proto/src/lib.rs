@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const CONTROL_PORT: u32 = 1024;
 /// The host dials this for each Docker API connection; the guest joins it to dockerd's socket.
 pub const DOCKER_PORT: u32 = 1025;
-/// The host dials this for each connection to a forwarded port, and first sends the TCP port
-/// as a line; the guest joins it to that port on its loopback.
+/// The host dials this for each connection to a forwarded port, and first sends the address it
+/// came to as a line, `127.0.0.1:8080` or `[::1]:8080`; the guest joins it to that port on its
+/// loopback of the same family, else the other one's.
 pub const FORWARD_PORT: u32 = 1026;
 
 /// One line on the control channel. Host to guest: `Time`, `Key`, `Poweroff`; guest to

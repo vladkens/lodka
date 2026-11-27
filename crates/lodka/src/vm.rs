@@ -242,11 +242,12 @@ fn docker(conn: Connector) -> io::Result<()> {
   Ok(())
 }
 
-/// Each connection to a forwarded port: a vsock stream to the guest that starts with the port.
+/// Each connection to a forwarded port: a vsock stream to the guest that starts with the Mac's
+/// address it came to.
 fn dial(conn: Connector) -> Dial {
-  Arc::new(move |port| {
+  Arc::new(move |addr| {
     let (a, mut b) = vsock::pair()?;
-    writeln!(b, "{port}")?;
+    writeln!(b, "{addr}")?;
     conn.connect(FORWARD_PORT, a);
     Ok(b)
   })
