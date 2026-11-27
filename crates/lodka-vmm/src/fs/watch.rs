@@ -67,7 +67,7 @@ unsafe extern "C" {
 pub type Handler = Box<dyn Fn(&[u8], u32) + Send + Sync>;
 
 /// Watches `root` for the rest of the process's life, calling `f` on a queue of its own.
-pub fn watch(root: &CStr, f: Handler) -> io::Result<()> {
+pub fn start(root: &CStr, f: Handler) -> io::Result<()> {
   // The stream is never stopped, so its handler is never freed.
   let info = Box::into_raw(Box::new(f));
   let flags = NO_DEFER | IGNORE_SELF | FILE_EVENTS;
@@ -111,7 +111,7 @@ extern "C" fn changed(
   flags: *const u32,
   _ids: *const u64,
 ) {
-  // SAFETY: FSEvents passes `n` C strings and as many flags, and the `info` that `watch` leaked.
+  // SAFETY: FSEvents passes `n` C strings and as many flags, and the `info` that `start` leaked.
   unsafe {
     let f = &*(info as *const Handler);
     let paths = std::slice::from_raw_parts(paths as *const *const c_char, n);

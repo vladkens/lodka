@@ -45,14 +45,36 @@ pub struct Fs {
   /// The FORGET queue's, then one per request queue.
   wakes: Vec<Arc<Wake>>,
   notes: Arc<Notes>,
-  sync: Arc<OnceLock<Sync>>,
+  sync: Arc<OnceLock<SyncQueues>>,
 }
 
 /// The sync queues, once the driver started the device.
-struct Sync {
+struct SyncQueues {
   mem: Arc<Mem>,
   first: u16,
   queues: Vec<Mutex<Queue>>,
+}
+
+impl SyncQueues {
+  /// Serves the requests on a sync queue on the calling thread: the vCPU's, which then finds
+  /// them done, so no interrupt.
+  fn serve(&self, server: &Server, queue: u16) -> bool {
+    let Some(q) = queue.checked_sub(self.first).and_then(|i| self.queues.get(i as usize)) else {
+      return false;
+    };
+
+    let mut q = q.lock().unwrap();
+    let mut serve = || -> io::Result<()> {
+      while let Some(chain) = q.pop(&self.mem)? {
+        let len = server.serve(&self.mem, &chain);
+        q.push(&self.mem, chain.head, len)?;
+      }
+
+      Ok(())
+    };
+
+    serve().is_ok()
+  }
 }
 
 /// Notifications for the guest, waiting for buffers on the notification queue.
@@ -112,7 +134,7 @@ impl Fs {
     let notes = Arc::new(Notes { pending: Mutex::default(), wake: Arc::new(Wake::new()?) });
     let (s, n) = (server.clone(), notes.clone());
     let changed = Box::new(move |path: &[u8], flags| n.send(s.changed(path, flags)));
-    match watch::watch(server.root(), changed) {
+    match watch::start(server.root(), changed) {
       Ok(()) => server.watched(),
       Err(e) => eprintln!("lodka: {tag}: {e}; the guest's caches of it expire in a second"),
     }
@@ -137,10 +159,7 @@ impl Device for Fs {
   }
 
   fn queues(&self) -> Vec<u16> {
-    let mut x = vec![QUEUE, SMALL];
-    x.extend(vec![QUEUE; self.queues]);
-    x.extend(vec![SMALL; self.queues]);
-    x
+    [vec![QUEUE, SMALL], vec![QUEUE; self.queues], vec![SMALL; self.queues]].concat()
   }
 
   /// struct virtio_fs_config: the tag, NUL-padded; the request queues; the notification
@@ -194,7 +213,7 @@ impl Device for Fs {
 
       let first = (first + self.queues) as u16;
       let queues = queues.into_iter().map(Mutex::new).collect();
-      let _ = self.sync.set(Sync { mem, first, queues });
+      let _ = self.sync.set(SyncQueues { mem, first, queues });
     }
 
     Ok(())
@@ -207,35 +226,17 @@ impl Device for Fs {
       1 if first == 2 => self.notes.wake.wake(),
       q if q < first + self.queues => self.wakes[q + 1 - first].wake(),
       _ => {
-        serve_sync(&self.sync, &self.server, queue);
+        if let Some(x) = self.sync.get() {
+          x.serve(&self.server, queue);
+        }
       }
     }
   }
 
   fn call(&self) -> Option<Call> {
     let (sync, server) = (self.sync.clone(), self.server.clone());
-    Some(Arc::new(move |queue| serve_sync(&sync, &server, queue)))
+    Some(Arc::new(move |queue| sync.get().is_some_and(|x| x.serve(&server, queue))))
   }
-}
-
-/// Serves the requests on a sync queue on the calling thread: the vCPU's, which then finds them
-/// done, so no interrupt.
-fn serve_sync(sync: &OnceLock<Sync>, server: &Server, queue: u16) -> bool {
-  let Some(s) = sync.get() else { return false };
-  let Some(q) = queue.checked_sub(s.first).and_then(|i| s.queues.get(i as usize)) else {
-    return false;
-  };
-
-  let mut q = q.lock().unwrap();
-  let mut serve = || -> io::Result<()> {
-    while let Some(chain) = q.pop(&s.mem)? {
-      let len = server.serve(&s.mem, &chain);
-      q.push(&s.mem, chain.head, len)?;
-    }
-
-    Ok(())
-  };
-  serve().is_ok()
 }
 
 /// Serves the queue until it is empty; returns whether it used any buffers. A FORGET has no

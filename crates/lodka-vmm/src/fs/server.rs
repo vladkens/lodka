@@ -19,11 +19,16 @@ use super::mac::{self, Entry, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat};
 use crate::mem::Mem;
 use crate::virtio::Chain;
 
+// Linux's numbers, which the guest reads.
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
+const E2BIG: i32 = 7;
 const EINVAL: i32 = 22;
+const ERANGE: i32 = 34;
+const ENAMETOOLONG: i32 = 36;
 const ENOSYS: i32 = 38;
+const ELOOP: i32 = 40;
 const ENODATA: i32 = 61;
 const ESTALE: i32 = 116;
 
@@ -105,8 +110,9 @@ impl Server {
   pub fn new(root: &Path) -> io::Result<Server> {
     // Opened with no symlink on the way, as every node is.
     let root = CString::new(root.canonicalize()?.into_os_string().into_vec())?;
+    // `open` gives Linux's errno, for the guest; errno is still macOS's.
     let fd =
-      open(&root, libc::O_RDONLY | libc::O_DIRECTORY).map_err(io::Error::from_raw_os_error)?;
+      open(&root, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|_| io::Error::last_os_error())?;
     let st = mac::fstat(fd.as_raw_fd())?;
     let node = Node { dev: st.dev, ino: st.ino, kind: S_IFDIR, refs: 1, seen: None };
     let nodes = Nodes {
@@ -149,6 +155,7 @@ impl Server {
     const MOVED: u32 = 0x200 | 0x800;
     const NAME: u32 = CREATED | MOVED;
     const DATA: u32 = 0x1000;
+
     if flags & LOST != 0 {
       return vec![inc_epoch()];
     }
@@ -160,17 +167,14 @@ impl Server {
       return Vec::new();
     }
 
-    let mut out = Vec::new();
     let parent = lstat(dir).and_then(|st| self.known(&st));
     let Some(st) = lstat(path) else {
-      if let Some(parent) = parent {
-        let x = abi::NotifyDeleteOut { parent, child: 0, namelen: name.len() as u32, padding: 0 };
-        out.push(note(abi::NOTIFY_DELETE, &[abi::bytes(&x), name, &[0]]));
-      }
-
-      return out;
+      let Some(parent) = parent else { return Vec::new() };
+      let x = abi::NotifyDeleteOut { parent, child: 0, namelen: name.len() as u32, padding: 0 };
+      return vec![note(abi::NOTIFY_DELETE, &[abi::bytes(&x), name, &[0]])];
     };
 
+    let mut out = Vec::new();
     let known = self.known(&st);
     if let Some(ino) = known {
       // Contents dropped too, or only the attributes.
@@ -184,6 +188,7 @@ impl Server {
       let x = abi::NotifyInvalEntryOut { parent, namelen: name.len() as u32, flags };
       out.push(note(abi::NOTIFY_INVAL_ENTRY, &[abi::bytes(&x), name, &[0]]));
     };
+
     // FSEvents keeps a file's Created flag on its later events: a name for a node the guest
     // has is not new, unless it was moved.
     if flags & MOVED != 0 || (flags & CREATED != 0 && known.is_none()) {
@@ -367,8 +372,9 @@ impl Server {
       abi::WRITE => self.write(r),
       abi::STATFS => {
         let dir = self.dir(abi::ROOT_ID)?;
-        // SAFETY: fstatfs fills a zeroed statfs.
+        // SAFETY: a plain C struct, valid zeroed.
         let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: fstatfs fills one statfs.
         if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut s) } != 0 {
           return Err(os());
         }
@@ -408,8 +414,7 @@ impl Server {
         Ok(Out::Bytes(Vec::new()))
       }
       abi::OPENDIR => {
-        let fd = open(&self.path(id)?, libc::O_RDONLY | libc::O_DIRECTORY)?;
-        self.check(id, fd.as_raw_fd())?;
+        let fd = self.open_node(id, libc::O_RDONLY | libc::O_DIRECTORY)?;
         let fh = self.add_handle(fd);
         reply(&abi::OpenOut { fh, open_flags: abi::FOPEN_CACHE_DIR, ..Default::default() })
       }
@@ -431,7 +436,7 @@ impl Server {
       abi::GETXATTR => {
         let x: abi::GetxattrIn = arg(r.args, 0)?;
         let (name, _) = cstr(r.args, size_of::<abi::GetxattrIn>())?;
-        if hidden(name) {
+        if hidden(name.to_bytes()) {
           return Err(ENODATA);
         }
 
@@ -444,7 +449,7 @@ impl Server {
       abi::SETXATTR => self.setxattr(r),
       abi::REMOVEXATTR => {
         let (name, _) = cstr(r.args, 0)?;
-        if hidden(name) {
+        if hidden(name.to_bytes()) {
           return Err(EPERM);
         }
 
@@ -613,9 +618,7 @@ impl Server {
     let fd = Arc::new(self.open_node(id, libc::O_RDONLY | libc::O_DIRECTORY)?);
     let mut dirs = self.dirs.lock().unwrap();
     if dirs.len() >= DIRS {
-      let root = dirs.remove(&abi::ROOT_ID);
-      dirs.clear();
-      dirs.extend(root.map(|x| (abi::ROOT_ID, x)));
+      dirs.retain(|&x, _| x == abi::ROOT_ID);
     }
 
     dirs.insert(id, fd.clone());
@@ -646,14 +649,7 @@ impl Server {
       return mac::fstat(self.dir(id)?.as_raw_fd()).map_err(err);
     }
 
-    let path = self.path(id)?;
-    // SAFETY: lstat fills a zeroed stat.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(path.as_ptr(), &mut st) } != 0 {
-      return Err(os());
-    }
-
-    let st = Stat::from_stat(&st);
+    let st = mac::lstat(&self.path(id)?).map_err(err)?;
     match (st.dev, st.ino) == (n.dev, n.ino) {
       true => Ok(st),
       false => Err(ESTALE),
@@ -856,18 +852,18 @@ impl Server {
       let at = (x.off_in + done) as i64;
       // SAFETY: pread writes at most `want` bytes into the buffer.
       let n = unsafe { libc::pread(from.fd.as_raw_fd(), buf.as_mut_ptr().cast(), want, at) };
-      if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-        continue;
-      }
-
-      if n <= 0 {
-        return if n == 0 || done > 0 { Ok(done) } else { Err(os()) };
-      }
+      let n = match n {
+        0 => return Ok(done),
+        n if n > 0 => n as usize,
+        _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+        _ if done > 0 => return Ok(done),
+        _ => return Err(os()),
+      };
 
       let mut put = 0;
-      while put < n as usize {
+      while put < n {
         let at = (x.off_out + done + put as u64) as i64;
-        let rest = &buf[put..n as usize];
+        let rest = &buf[put..n];
         // SAFETY: pwrite reads `rest`, which is in the buffer.
         let w = unsafe { libc::pwrite(to.fd.as_raw_fd(), rest.as_ptr().cast(), rest.len(), at) };
         match w {
@@ -919,11 +915,12 @@ impl Server {
       file.as_raw_fd()
     };
 
-    // SAFETY (all four): calls on an open descriptor.
+    // SAFETY: fchmod on an open descriptor.
     if v & abi::FATTR_MODE != 0 && unsafe { libc::fchmod(fd, (x.mode & 0o7777) as u16) } != 0 {
       return Err(os());
     }
 
+    // SAFETY: ftruncate on an open descriptor.
     if v & abi::FATTR_SIZE != 0 && unsafe { libc::ftruncate(fd, x.size as i64) } != 0 {
       return Err(os());
     }
@@ -932,6 +929,7 @@ impl Server {
       kill_suidgid(fd);
     }
 
+    // SAFETY: futimens reads two timespecs, on an open descriptor.
     if v & (abi::FATTR_ATIME | abi::FATTR_MTIME) != 0
       && unsafe { libc::futimens(fd, times(&x).as_ptr()) } != 0
     {
@@ -947,17 +945,12 @@ impl Server {
     let (old, at) = name(args, at)?;
     let (new, _) = name(args, at)?;
     // Linux's RENAME_NOREPLACE and RENAME_EXCHANGE; RENAME_WHITEOUT is overlayfs' own.
-    let mut f = 0;
-    for (l, m) in [(1, libc::RENAME_EXCL), (2, libc::RENAME_SWAP)] {
-      if flags & l != 0 {
-        f |= m;
-      }
-    }
-
     if flags & !3 != 0 {
       return Err(EINVAL);
     }
 
+    let bits = [(1, libc::RENAME_EXCL), (2, libc::RENAME_SWAP)];
+    let f = bits.into_iter().filter(|&(l, _)| flags & l != 0).fold(0, |f, (_, m)| f | m);
     let (a, b) = (self.dir(from)?, self.dir(to)?);
     // SAFETY: NUL-terminated names in open directories.
     if unsafe { libc::renameatx_np(a.as_raw_fd(), old.as_ptr(), b.as_raw_fd(), new.as_ptr(), f) }
@@ -1042,21 +1035,15 @@ impl Server {
     };
     if n < 0 {
       return Err(match os() {
-        34 if size == 0 => 7, // ERANGE with no size given: longer than Linux allows, E2BIG
+        ERANGE if size == 0 => E2BIG, // with no size given: longer than Linux allows
         x => x,
       });
     }
 
     buf.truncate(n as usize);
     if name.is_none() {
-      let names: Vec<&[u8]> = buf.split(|&x| x == 0).filter(|x| !x.is_empty()).collect();
-      let mut kept = Vec::new();
-      for x in names.into_iter().filter(|x| !x.starts_with(b"com.apple.")) {
-        kept.extend_from_slice(x);
-        kept.push(0);
-      }
-
-      buf = kept;
+      let names = buf.split(|&x| x == 0).filter(|x| !x.is_empty() && !hidden(x));
+      buf = names.flat_map(|x| x.iter().copied().chain([0])).collect();
     }
 
     if size == 0 {
@@ -1064,7 +1051,7 @@ impl Server {
     }
 
     if buf.len() > size as usize {
-      return Err(34); // ERANGE
+      return Err(ERANGE);
     }
 
     Ok(Out::Bytes(buf))
@@ -1075,18 +1062,14 @@ impl Server {
     let x: abi::SetxattrIn = arg(&pad(r.args, size_of::<abi::SetxattrIn>()), 0)?;
     let (name, at) = cstr(r.args, abi::COMPAT_SETXATTR_IN_SIZE)?;
     let value = r.args.get(at..at + x.size as usize).ok_or(EINVAL)?;
-    if hidden(name) {
+    if hidden(name.to_bytes()) {
       return Err(EPERM);
     }
 
     // Linux's XATTR_CREATE and XATTR_REPLACE are 1 and 2.
-    let mut opts = libc::XATTR_NOFOLLOW;
-    for (l, m) in [(1, libc::XATTR_CREATE), (2, libc::XATTR_REPLACE)] {
-      if x.flags & l != 0 {
-        opts |= m;
-      }
-    }
-
+    let bits = [(1, libc::XATTR_CREATE), (2, libc::XATTR_REPLACE)];
+    let opts = bits.into_iter().filter(|&(l, _)| x.flags & l != 0).fold(0, |f, (_, m)| f | m);
+    let opts = opts | libc::XATTR_NOFOLLOW;
     let path = self.path(r.h.nodeid)?;
     // SAFETY: NUL-terminated strings and a value of its length.
     if unsafe {
@@ -1120,10 +1103,7 @@ pub fn inc_epoch() -> Vec<u8> {
 }
 
 fn lstat(path: &[u8]) -> Option<Stat> {
-  let path = CString::new(path).ok()?;
-  // SAFETY: lstat fills a zeroed stat from a NUL-terminated path.
-  let mut st: libc::stat = unsafe { std::mem::zeroed() };
-  (unsafe { libc::lstat(path.as_ptr(), &mut st) } == 0).then(|| Stat::from_stat(&st))
+  mac::lstat(&CString::new(path).ok()?).ok()
 }
 
 fn arg<T: Pod>(args: &[u8], at: usize) -> Result<T, i32> {
@@ -1158,8 +1138,9 @@ fn name(args: &[u8], at: usize) -> Result<(&CStr, usize), i32> {
   Ok((s, next))
 }
 
-fn hidden(name: &CStr) -> bool {
-  name.to_bytes().starts_with(b"com.apple.")
+/// An extended attribute macOS keeps to itself: the guest neither sees nor changes it.
+fn hidden(name: &[u8]) -> bool {
+  name.starts_with(b"com.apple.")
 }
 
 fn open(path: &CStr, flags: i32) -> Result<OwnedFd, i32> {
@@ -1170,7 +1151,7 @@ fn open(path: &CStr, flags: i32) -> Result<OwnedFd, i32> {
   let fd = unsafe { libc::open(path.as_ptr(), flags) };
   if fd < 0 {
     return Err(match os() {
-      40 => ESTALE, // ELOOP: a symlink where the file was
+      ELOOP => ESTALE, // a symlink where the file was
       x => x,
     });
   }
@@ -1183,23 +1164,19 @@ fn open(path: &CStr, flags: i32) -> Result<OwnedFd, i32> {
 /// FIFO and a socket's file it may.
 fn mknod(dir: RawFd, name: &CStr, mode: u32) -> Result<(), i32> {
   let perm = (mode & 0o7777) as u16;
-  // SAFETY: (all) a NUL-terminated name in an open directory.
   let r = match mode & S_IFMT {
     S_IFREG => {
-      let fd = unsafe {
-        libc::openat(
-          dir,
-          name.as_ptr(),
-          libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
-          perm as u32,
-        )
-      };
+      let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC;
+      // SAFETY: a NUL-terminated name in an open directory.
+      let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, perm as u32) };
       if fd >= 0 {
+        // SAFETY: the descriptor openat just returned, closed once.
         unsafe { libc::close(fd) };
       }
 
       fd.min(0)
     }
+    // SAFETY: as for S_IFREG.
     0o010000 => unsafe { libc::mkfifoat(dir, name.as_ptr(), perm) },
     0o140000 => return bind_at(dir, name, perm),
     _ => return Err(EPERM),
@@ -1226,7 +1203,7 @@ fn bind_at(dir: RawFd, name: &CStr, perm: u16) -> Result<(), i32> {
   // SAFETY: sockaddr_un is integers and bytes, all zero a valid value.
   let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
   if b.len() >= addr.sun_path.len() {
-    return Err(36); // ENAMETOOLONG
+    return Err(ENAMETOOLONG);
   }
 
   addr.sun_family = libc::AF_UNIX as u8;

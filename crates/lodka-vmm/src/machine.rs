@@ -22,13 +22,14 @@ const UART_BASE: u64 = 0x0900_0000;
 const RTC_BASE: u64 = 0x0901_0000;
 const VIRTIO_BASE: u64 = 0x0a00_0000;
 const VIRTIO_SIZE: u64 = 0x200;
-/// lodka's own hypervisor call (SMCCC 1.1, a fast SMC64 vendor-specific one): serve a virtio
-/// device's queue now, on the vCPU that asks; the guest's virtio-fs sync queues use it.
-pub const HVC_QUEUE: u32 = 0xc600_0100;
 const GIC_BASE: u64 = 0x1000_0000;
 pub const RAM_BASE: u64 = 0x4000_0000;
 const _: () =
   assert!(RTC_BASE + 0x1000 <= VIRTIO_BASE && VIRTIO_BASE + 64 * VIRTIO_SIZE <= GIC_BASE);
+
+/// lodka's own hypervisor call (SMCCC 1.1, a fast SMC64 vendor-specific one): serve a virtio
+/// device's queue now, on the vCPU that asks; the guest's virtio-fs sync queues use it.
+pub const HVC_QUEUE: u32 = 0xc600_0100;
 
 const PHANDLE_GIC: u32 = 1;
 const PHANDLE_CLOCK: u32 = 2;

@@ -38,8 +38,10 @@ impl Stat {
   pub fn is_dir(&self) -> bool {
     self.kind() == S_IFDIR
   }
+}
 
-  pub fn from_stat(st: &libc::stat) -> Stat {
+impl From<&libc::stat> for Stat {
+  fn from(st: &libc::stat) -> Stat {
     Stat {
       dev: st.st_dev,
       ino: st.st_ino,
@@ -59,13 +61,26 @@ impl Stat {
 }
 
 pub fn fstat(fd: RawFd) -> io::Result<Stat> {
-  // SAFETY: fstat fills a zeroed stat.
+  // SAFETY: a plain C struct, valid zeroed.
   let mut st: libc::stat = unsafe { std::mem::zeroed() };
+  // SAFETY: fstat fills one stat.
   if unsafe { libc::fstat(fd, &mut st) } != 0 {
     return Err(io::Error::last_os_error());
   }
 
-  Ok(Stat::from_stat(&st))
+  Ok(Stat::from(&st))
+}
+
+/// The attributes of a symlink itself, not of what it points to.
+pub fn lstat(path: &CStr) -> io::Result<Stat> {
+  // SAFETY: as in `fstat`.
+  let mut st: libc::stat = unsafe { std::mem::zeroed() };
+  // SAFETY: lstat fills one stat from a NUL-terminated path.
+  if unsafe { libc::lstat(path.as_ptr(), &mut st) } != 0 {
+    return Err(io::Error::last_os_error());
+  }
+
+  Ok(Stat::from(&st))
 }
 
 // MARK: Attributes
@@ -169,10 +184,10 @@ pub fn list(fd: RawFd) -> io::Result<Vec<Entry>> {
     let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), size) };
     let mut at = 0;
     for _ in 0..n {
-      let len = bytes.get(at..at + 4).map(|x| u32::from_ne_bytes(x.try_into().unwrap()));
-      let Some(len) = len.map(|x| x as usize).filter(|&x| x >= 4 && at + x <= size) else {
+      let len = Reader { rec: &bytes[at..], at: 0 }.u32() as usize;
+      if len < 4 || at + len > size {
         return Err(io::Error::other("getattrlistbulk: a record past the buffer"));
-      };
+      }
 
       match parse(&bytes[at..at + len]) {
         Ok(x) => out.push(x),
@@ -410,8 +425,7 @@ pub fn errno(e: &io::Error) -> i32 {
 /// macOS's open flags for Linux's (arm64 numbers). The kernel keeps O_CREAT and O_EXCL to
 /// itself on OPEN; O_DIRECT is F_NOCACHE, set apart.
 pub fn open_flags(linux: u32) -> i32 {
-  let mut f = (linux & 3) as i32; // O_RDONLY, O_WRONLY, O_RDWR
-  for (l, m) in [
+  let bits = [
     (0o100, libc::O_CREAT),
     (0o200, libc::O_EXCL),
     (0o1000, libc::O_TRUNC),
@@ -419,13 +433,9 @@ pub fn open_flags(linux: u32) -> i32 {
     (0o4000, libc::O_NONBLOCK),
     (0o10000, libc::O_DSYNC),
     (0o4010000, libc::O_SYNC),
-  ] {
-    if linux & l == l {
-      f |= m;
-    }
-  }
-
-  f
+  ];
+  let f = (linux & 3) as i32; // O_RDONLY, O_WRONLY, O_RDWR
+  bits.into_iter().filter(|&(l, _)| linux & l == l).fold(f, |f, (_, m)| f | m)
 }
 
 /// Linux's O_DIRECT on arm64.
@@ -446,7 +456,7 @@ mod tests {
     d
   }
 
-  fn lstat(p: &std::path::Path) -> Stat {
+  fn metadata(p: &std::path::Path) -> Stat {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(p).unwrap();
     Stat {
@@ -473,7 +483,7 @@ mod tests {
     for name in ["sub", "File.txt", "link"] {
       let (got, st) = stat_at(dir.as_raw_fd(), &CString::new(name).unwrap()).unwrap();
       assert_eq!(got, name.as_bytes());
-      let want = lstat(&d.join(name));
+      let want = metadata(&d.join(name));
       // A directory's blksize and blocks differ between the calls; the rest must not.
       assert_eq!(
         (st.dev, st.ino, st.mode, st.nlink, st.size),
@@ -495,13 +505,10 @@ mod tests {
     let mut names: Vec<_> = list(dir.as_raw_fd()).unwrap().into_iter().map(|x| x.0).collect();
     names.sort();
     assert_eq!(names, [b"File.txt".to_vec(), b"link".to_vec(), b"sub".to_vec()]);
-    let p = path(want_dev(&d), lstat(&d.join("File.txt")).ino).unwrap();
+
+    let p = path(metadata(&d).dev, metadata(&d.join("File.txt")).ino).unwrap();
     assert!(p.to_bytes().ends_with(b"/File.txt"));
     let _ = std::fs::remove_dir_all(&d);
-  }
-
-  fn want_dev(d: &std::path::Path) -> i32 {
-    lstat(d).dev
   }
 
   #[test]
