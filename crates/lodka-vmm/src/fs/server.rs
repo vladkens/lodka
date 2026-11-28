@@ -74,7 +74,9 @@ pub struct Server {
   dropped: AtomicU64,
   /// FSEvents tells the guest what changes on the Mac.
   watched: AtomicBool,
-  /// The changes FSEvents saw so far: what was listed before the last is no longer news.
+  /// The changes FSEvents saw so far: what was found before the last may be old.
+  mac_changes: AtomicU64,
+  /// Those and the guest's own: what was listed before the last may be old.
   changes: AtomicU64,
 }
 
@@ -112,7 +114,7 @@ struct Handle {
 #[derive(Default)]
 struct Listing {
   base: usize,
-  /// Each with the count of the Mac's changes before it was listed.
+  /// Each with the count of changes before it was listed.
   entries: Vec<(Entry, u64)>,
   done: bool,
   /// Where the descriptor is is unknown after an error: listed again from the start.
@@ -194,6 +196,7 @@ impl Server {
       dirs: Mutex::new(HashMap::from([(abi::ROOT_ID, Arc::new(fd))])),
       dropped: AtomicU64::new(0),
       watched: AtomicBool::new(false),
+      mac_changes: AtomicU64::new(0),
       changes: AtomicU64::new(0),
     })
   }
@@ -226,7 +229,8 @@ impl Server {
     // Its mode, ACL or owner changed.
     const META: u32 = 0x400 | 0x4000;
 
-    // Counted before the guest hears of it: a listing's attributes from before are old then.
+    // Counted before the guest hears of it: attributes found before are old then.
+    self.mac_changes.fetch_add(1, Ordering::SeqCst);
     self.changes.fetch_add(1, Ordering::SeqCst);
 
     // A directory moved, maybe out of the share, or its permissions changed: a descriptor kept
@@ -898,6 +902,8 @@ impl Server {
   /// The entry for `name` in the directory node `parent`, open as `dir`; a lookup for the guest,
   /// or the reply to its making the file (`made`).
   fn entry_at(&self, parent: u64, dir: &OwnedFd, name: &CStr, made: bool) -> Res {
+    // The guest's own changes reach its inodes with their replies.
+    let changes = self.mac_changes.load(Ordering::SeqCst);
     let (stored, st) = mac::stat_at(dir.as_raw_fd(), name).map_err(err)?;
     // Byte for byte: on a case- or normalization-insensitive volume another spelling finds the
     // file too, and the guest would see one inode under two names.
@@ -906,9 +912,15 @@ impl Server {
     }
 
     let pdev = self.node(parent)?.dev;
-    let e = self.entry(&st, pdev)?;
+    let mut e = self.entry(&st, pdev)?;
     if made {
       self.told(e.nodeid);
+    }
+
+    // A change counted between the stat and the node found no node to tell of it: the guest
+    // takes the attributes as old at once. One counted after reaches the inode.
+    if self.mac_changes.load(Ordering::SeqCst) != changes {
+      (e.attr_valid, e.attr_valid_nsec) = (0, 0);
     }
 
     reply(&e)

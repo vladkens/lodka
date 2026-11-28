@@ -6,10 +6,10 @@ what changed on the Mac (FSEvents): INVAL_INODE for a file's contents or attribu
 INVAL_ENTRY for a name made, DELETE for a name removed, INC_EPOCH when it lost track. Each drops
 what the guest cached, as the /dev/fuse notifications do, and tells fsnotify, so inotify
 watchers in the guest see changes made on the Mac. INC_EPOCH drops every inode's attributes,
-pages and listing too, which /dev/fuse's leaves: an open file looks up no name. An INVAL_INODE
-for an inode the guest has yet to make counts as an evict: a LOOKUP or READDIRPLUS reply on its
-way, with attributes from before the change, leaves them stale. The guest can then cache names
-and attributes for long.
+pages and listing too, which /dev/fuse's leaves: an open file looks up no name. INVAL_INODE and
+INC_EPOCH count as an evict too: an inode a LOOKUP or READDIRPLUS reply on its way makes, with
+attributes from before the change, takes them as stale. The guest can then cache names and
+attributes for long.
 
 Three flags of lodka's own. VIRTIO_FS_INVAL_MODIFIED on an INVAL_ENTRY, for a file the guest
 never looked up whose contents changed, has the guest look it up if inotify watches its
@@ -35,7 +35,7 @@ index dc61efd..ae0921c 100644
  			truncate_pagecache(inode, 0);
  		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
 diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
-index c135d0d..9c041ac 100644
+index c135d0d..a8aa991 100644
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
 @@ -6,6 +6,11 @@
@@ -88,7 +88,7 @@ index c135d0d..9c041ac 100644
  			if (first)
  				ret = snprintf(buf + pos, size - pos, "%u", cpu);
  			else
-@@ -909,6 +920,279 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
+@@ -909,6 +920,280 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
  	spin_unlock(&fsvq->lock);
  }
  
@@ -115,13 +115,12 @@ index c135d0d..9c041ac 100644
 +	struct inode *inode;
 +
 +	/*
-+	 * No inode yet: a LOOKUP or READDIRPLUS reply on its way may make one from attributes older
-+	 * than the change. Counted as an evict, it makes them stale.
++	 * Counted as an evict, before the inode is looked for: one a LOOKUP or READDIRPLUS reply on
++	 * its way makes, from attributes older than the change, takes them as stale.
 +	 */
-+	if (fuse_reverse_inval_inode(fc, o->ino, o->off, o->len)) {
-+		atomic64_inc(&fc->evict_ctr);
++	atomic64_inc_return(&fc->evict_ctr);
++	if (fuse_reverse_inval_inode(fc, o->ino, o->off, o->len))
 +		return;
-+	}
 +
 +	inode = fuse_ilookup(fc, o->ino, NULL);
 +	if (!inode)
@@ -240,6 +239,8 @@ index c135d0d..9c041ac 100644
 +	struct fuse_mount *fm;
 +
 +	atomic_inc(&fc->epoch);
++	/* For the inodes replies on their way make, which the walk misses: as in inval_inode */
++	atomic64_inc_return(&fc->evict_ctr);
 +	list_for_each_entry(fm, &fc->mounts, fc_entry) {
 +		struct super_block *sb = fm->sb;
 +
@@ -368,7 +369,7 @@ index c135d0d..9c041ac 100644
  static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *fs)
  {
  	const struct cpumask *mask, *masks;
-@@ -921,12 +1205,12 @@ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *f
+@@ -921,12 +1206,12 @@ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *f
  		goto fallback;
  
  	for (q = 0; q < fs->num_request_queues; q++) {
@@ -383,7 +384,7 @@ index c135d0d..9c041ac 100644
  	}
  
  	return;
-@@ -936,13 +1220,13 @@ fallback:
+@@ -936,13 +1221,13 @@ fallback:
  	/* If even this fails we default to all CPUs use first request queue */
  	if (!masks) {
  		for_each_possible_cpu(cpu)
@@ -399,7 +400,7 @@ index c135d0d..9c041ac 100644
  	}
  	kfree(masks);
  }
-@@ -970,6 +1254,10 @@ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
+@@ -970,6 +1255,10 @@ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
  		INIT_WORK(&fsvq->done_work, virtio_fs_requests_done_work);
  		INIT_WORK(&fsvq->dispatch_work,
  				virtio_fs_request_dispatch_work);
@@ -410,7 +411,7 @@ index c135d0d..9c041ac 100644
  	} else {
  		INIT_WORK(&fsvq->done_work, virtio_fs_hiprio_done_work);
  		INIT_WORK(&fsvq->dispatch_work,
-@@ -999,7 +1287,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -999,7 +1288,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	/* Truncate nr of request queues to nr_cpu_id */
  	fs->num_request_queues = min_t(unsigned int, fs->num_request_queues,
  					nr_cpu_ids);
@@ -429,7 +430,7 @@ index c135d0d..9c041ac 100644
  	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
  	if (!fs->vqs)
  		return -ENOMEM;
-@@ -1018,11 +1316,18 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1018,11 +1317,18 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	virtio_fs_init_vq(&fs->vqs[VQ_HIPRIO], "hiprio", VQ_HIPRIO);
  	vqs_info[VQ_HIPRIO].name = fs->vqs[VQ_HIPRIO].name;
  
@@ -450,7 +451,7 @@ index c135d0d..9c041ac 100644
  		virtio_fs_init_vq(&fs->vqs[i], vq_name, VQ_REQUEST);
  		vqs_info[i].callback = virtio_fs_vq_done;
  		vqs_info[i].name = fs->vqs[i].name;
-@@ -1200,6 +1505,10 @@ static int virtio_fs_probe(struct virtio_device *vdev)
+@@ -1200,6 +1506,10 @@ static int virtio_fs_probe(struct virtio_device *vdev)
  	 */
  	virtio_device_ready(vdev);
  
@@ -461,7 +462,7 @@ index c135d0d..9c041ac 100644
  	ret = virtio_fs_add_instance(vdev, fs);
  	if (ret < 0)
  		goto out_vqs;
-@@ -1271,7 +1580,7 @@ static const struct virtio_device_id id_table[] = {
+@@ -1271,7 +1581,7 @@ static const struct virtio_device_id id_table[] = {
  	{},
  };
  
@@ -470,7 +471,7 @@ index c135d0d..9c041ac 100644
  
  static struct virtio_driver virtio_fs_driver = {
  	.driver.name		= KBUILD_MODNAME,
-@@ -1738,7 +2047,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+@@ -1738,7 +2048,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
  	mutex_lock(&virtio_fs_mutex);
  	fs = virtio_fs_find_instance(fsc->source);
  	if (fs)
