@@ -3,6 +3,7 @@
 LINT := uv run --script https://raw.githubusercontent.com/vladkens/lint/main/rust.py
 CARGO_FLAGS := --release --locked
 GUEST := --target aarch64-unknown-linux-musl -p lodka-guest
+DIST := target/distrib/lodka-dev-aarch64-apple-darwin.tar.gz
 
 prepare:
 	cargo +nightly fmt
@@ -44,10 +45,11 @@ rootfs: guest
 
 images: kernel rootfs
 
-# The release archive for CI's rust-build: the binary, the guest (make images) and the readme
+# The release archive for CI's rust-build: the binary, the guest (make images) and the readme.
+# Without the files' xattrs, which macOS's tar packs by default.
 dist:
 	cargo build $(CARGO_FLAGS) -p lodka
 	rm -rf target/distrib && mkdir -p target/distrib
-	tar -czf target/distrib/lodka-dev-aarch64-apple-darwin.tar.gz -C $(CURDIR)/target/release lodka \
+	tar --no-mac-metadata -czf $(DIST) -C $(CURDIR)/target/release lodka \
 		-C $(CURDIR)/guest/out Image rootfs.img -C $(CURDIR) readme.md LICENSE
-	tar -tvzf target/distrib/lodka-dev-aarch64-apple-darwin.tar.gz
+	tar -tvzf $(DIST)

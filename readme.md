@@ -18,7 +18,7 @@ Requires a Mac with Apple silicon on macOS 26 or later.
 ## Install
 
 ```sh
-brew install vladkens/tap/lodka
+brew install vladkens/tap/lodka    # from v0.1.0, the first release
 ```
 
 Or from the sources:

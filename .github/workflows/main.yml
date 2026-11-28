@@ -11,35 +11,31 @@ on:
 permissions:
   contents: read
 
-# PR runs cancel older ones. A main run is never cancelled mid-way; a release commit gets its own group, so it is never replaced.
+# A PR's new run cancels its older one. Any other run is in a group of its own: never cancelled,
+# never kept waiting, a release commit's too.
 concurrency:
-  group: ${{ github.workflow }}-${{ startsWith(github.event.head_commit.message, 'release:') && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/cache@v6
-        with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - run: rustup update --no-self-update stable && rustup default stable
       - run: rustup target add aarch64-unknown-linux-musl # the guest's binary, linted too
       - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      # cargo's registry and target/, after rustup: the key has rustc's version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: make check
       - run: make test
 
   # The guest's kernel and root file system, built in a container: macOS runners have no Docker.
-  # Only for what rust-build builds below: a release PR or commit, or a manual run.
+  # On every run, so a PR that breaks them fails. The kernel is built again only when its files
+  # change; main's runs keep it in main's cache, which PRs and the release commit read (a PR's
+  # cache is its own).
   images:
-    if: "github.event_name == 'workflow_dispatch' || startsWith(github.event.pull_request.title, 'release: v') || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v'))"
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -61,9 +57,12 @@ jobs:
             guest/out/Image
             guest/out/rootfs.img
           if-no-files-found: error
+          retention-days: 1 # only for the build job below
 
   # vladkens/actions: build makes the archive with the guest; publish ships the release on a release: commit.
+  # Only for a release PR or commit, or a manual run: rust-build makes no files for the others.
   build:
+    if: "github.event_name == 'workflow_dispatch' || startsWith(github.event.pull_request.title, 'release: v') || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v'))"
     needs: images
     runs-on: macos-latest # Hypervisor.framework: the binary needs a Mac
     steps:
