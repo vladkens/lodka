@@ -230,7 +230,7 @@ impl Server {
     // for lookups in it, or in one under it, would still lead there as before. The others are
     // opened again as needed.
     if flags & LOST != 0 || (flags & IS_DIR != 0 && flags & (MOVED | META) != 0) {
-      self.dirs.lock().unwrap().retain(|&x, _| x == abi::ROOT_ID);
+      self.drop_dirs();
     }
 
     if flags & LOST != 0 {
@@ -320,6 +320,11 @@ impl Server {
       x => x,
     };
 
+    // Counted once done, before the guest hears: FSEvents doesn't tell of the guest's changes.
+    if changes(&h, &args) {
+      self.changes.fetch_add(1, Ordering::SeqCst);
+    }
+
     self.send(mem, chain, &h, out)
   }
 
@@ -382,7 +387,17 @@ impl Server {
 
         self.attr_out(id, &st)
       }
-      abi::SETATTR => self.setattr(r),
+      abi::SETATTR => {
+        let out = self.setattr(r)?;
+        // A folder's mode may take away the permission to search it, which a descriptor kept
+        // for lookups in a folder under it would skip.
+        let x: abi::SetattrIn = arg(r.args, 0)?;
+        if x.valid & abi::FATTR_MODE != 0 && self.node(id)?.kind == S_IFDIR {
+          self.drop_dirs();
+        }
+
+        Ok(out)
+      }
       abi::READLINK => {
         let (dir, name) = self.parent_of(id)?;
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
@@ -750,6 +765,11 @@ impl Server {
     }
 
     Ok(fd)
+  }
+
+  /// No descriptor is kept but the share's own: each directory is opened again by its path.
+  fn drop_dirs(&self) {
+    self.dirs.lock().unwrap().retain(|&x, _| x == abi::ROOT_ID);
   }
 
   /// A directory node's descriptor, kept for the next lookup in it.
@@ -1343,13 +1363,17 @@ impl Server {
       }
 
       if plus {
-        // `.` and `..` get no entry: the kernel counts no lookup for them; nor does a file past
-        // the nodes' limit, nor one listed before a change the guest heard of since, whose
-        // attributes it would keep.
-        let e = match fresh {
-          true => self.entry(st, me.dev).unwrap_or_default(),
-          false => abi::EntryOut::default(),
-        };
+        // No entry for `.` and `..`, which the kernel counts no lookup for, a file past the
+        // nodes' limit, or one listed before a change since, whose old attributes the guest
+        // would keep; one counted once the node is made reaches its inode.
+        let mut e = abi::EntryOut::default();
+        if fresh {
+          e = self.entry(st, me.dev).unwrap_or_default();
+          if e.nodeid != 0 && self.changes.load(Ordering::SeqCst) != changes {
+            self.forget(e.nodeid, 1);
+            e = abi::EntryOut::default();
+          }
+        }
 
         out.extend_from_slice(abi::bytes(&e));
       }
@@ -1481,6 +1505,29 @@ fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
 
 fn lstat(path: &[u8]) -> Option<Stat> {
   mac::lstat(&CString::new(path).ok()?).ok()
+}
+
+/// Whether a request changes what a listing tells of files: their names or attributes.
+fn changes(h: &abi::InHeader, args: &[u8]) -> bool {
+  match h.opcode {
+    abi::SETATTR
+    | abi::SYMLINK
+    | abi::MKNOD
+    | abi::MKDIR
+    | abi::UNLINK
+    | abi::RMDIR
+    | abi::RENAME
+    | abi::RENAME2
+    | abi::LINK
+    | abi::WRITE
+    | abi::CREATE
+    | abi::COPY_FILE_RANGE
+    | abi::COPY_FILE_RANGE_64 => true,
+    // Linux's O_TRUNC, or the set-id bits killed.
+    abi::OPEN => arg::<abi::OpenIn>(args, 0)
+      .is_ok_and(|x| x.flags & 0o1000 != 0 || x.open_flags & abi::OPEN_KILL_SUIDGID != 0),
+    _ => false,
+  }
 }
 
 fn arg<T: Pod>(args: &[u8], at: usize) -> Result<T, i32> {
@@ -2651,6 +2698,14 @@ mod tests {
     let e = t.call(abi::MKDIR, c, &cat(&[abi::bytes(&mk), &z("b")]), 256).0;
     std::fs::set_permissions(t.dir.join("p"), mode(0o755)).unwrap();
     assert_eq!(e, -EACCES);
+
+    // By the guest, of which FSEvents tells nothing.
+    assert_eq!(t.call(abi::MKDIR, c, &cat(&[abi::bytes(&mk), &z("b")]), 256).0, 0);
+    let sa = abi::SetattrIn { valid: abi::FATTR_MODE, mode: 0, ..Default::default() };
+    assert_eq!(t.call(abi::SETATTR, p, abi::bytes(&sa), 256).0, 0);
+    let e = t.call(abi::MKDIR, c, &cat(&[abi::bytes(&mk), &z("e")]), 256).0;
+    std::fs::set_permissions(t.dir.join("p"), mode(0o755)).unwrap();
+    assert_eq!(e, -EACCES);
   }
 
   /// READDIRPLUS gives no attributes listed before a change on the Mac the guest has heard of:
@@ -2688,6 +2743,14 @@ mod tests {
 
     let path = t.dir.canonicalize().unwrap().join("f00").into_os_string().into_vec();
     t.s.changed(&path, 0x1000);
+    let next = read(&mut t, first.last().unwrap().0);
+    assert!(!next.is_empty() && next.iter().all(|x| x.1 == 0));
+
+    // Nor before a change by the guest, of which FSEvents tells nothing.
+    let first = read(&mut t, 0);
+    assert!(first.iter().skip(2).all(|x| x.1 != 0 && x.2 == 2));
+    let sa = abi::SetattrIn { valid: abi::FATTR_SIZE, size: 3, ..Default::default() };
+    assert_eq!(t.call(abi::SETATTR, first[2].1, abi::bytes(&sa), 256).0, 0);
     let next = read(&mut t, first.last().unwrap().0);
     assert!(!next.is_empty() && next.iter().all(|x| x.1 == 0));
   }
