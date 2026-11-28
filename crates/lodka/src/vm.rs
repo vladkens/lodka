@@ -12,6 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ use std::{env, thread};
 use lodka_proto::{CONTROL_PORT, Ctl, DOCKER_PORT, FORWARD_PORT};
 use lodka_vmm::blk::Blk;
 use lodka_vmm::console::{Console, Rng};
+use lodka_vmm::fs::Fs;
 use lodka_vmm::machine::{Config, Machine, Stop, Stopper};
 use lodka_vmm::net::Net;
 use lodka_vmm::vsock::{self, Connector, Listener, Vsock};
@@ -113,6 +115,8 @@ pub fn serve() -> io::Result<()> {
   m.add(Box::new(Blk::new(disk, false, "lodka-data", queues)?));
   m.add(Box::new(net));
   m.add(Box::new(vsock));
+  // The Mac user's folders at the same path, so `docker run -v "$PWD:/app"` works from them.
+  m.add(Box::new(Fs::new("/Users", Path::new("/Users"), queues)?));
 
   *ctl.ports.lock().unwrap() = Some(Ports::new(dial(conn.clone())));
   docker(conn)?;

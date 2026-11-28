@@ -14,7 +14,7 @@ use std::{fs, thread};
 use crate::fdt::Fdt;
 use crate::hv;
 use crate::mem::{Mem, Mmio};
-use crate::virtio::{Device, Irq, Kick, Transport};
+use crate::virtio::{Call, Device, Irq, Kick, Transport};
 
 // Guest physical layout: the devices as QEMU's `virt` machine has them, the GIC after them, as
 // its redistributors' space is larger than `virt` leaves for it.
@@ -26,6 +26,10 @@ const GIC_BASE: u64 = 0x1000_0000;
 pub const RAM_BASE: u64 = 0x4000_0000;
 const _: () =
   assert!(RTC_BASE + 0x1000 <= VIRTIO_BASE && VIRTIO_BASE + 64 * VIRTIO_SIZE <= GIC_BASE);
+
+/// lodka's own hypervisor call (SMCCC 1.1, a fast SMC64 vendor-specific one): serve a virtio
+/// device's queue now, on the vCPU that asks; the guest's virtio-fs sync queues use it.
+pub const HVC_QUEUE: u32 = 0xc600_0100;
 
 const PHANDLE_GIC: u32 = 1;
 const PHANDLE_CLOCK: u32 = 2;
@@ -140,6 +144,8 @@ pub struct Machine {
   cpus: Arc<Cpus>,
   /// Virtio devices: MMIO base and SPI intid.
   virtio: Vec<(u64, u32)>,
+  /// Devices' queues served by HVC_QUEUE, by MMIO base.
+  calls: Vec<(u64, Call)>,
 }
 
 impl Machine {
@@ -167,7 +173,7 @@ impl Machine {
     bus.add(UART_BASE, 0x1000, Uart { out: cfg.console.clone() });
     bus.add(RTC_BASE, 0x1000, Rtc::default());
 
-    Ok(Machine { mem, cfg, gic, bus, cpus, virtio: Vec::new() })
+    Ok(Machine { mem, cfg, gic, bus, cpus, virtio: Vec::new(), calls: Vec::new() })
   }
 
   pub fn kick(&self) -> Kick {
@@ -186,6 +192,10 @@ impl Machine {
     // SPIs 0-15 are left for the platform devices (UART 1, RTC 2)
     let intid = self.gic.spis.0 + 16 + i as u32;
     let irq = Irq::new(intid, self.kick());
+    if let Some(x) = dev.call() {
+      self.calls.push((base, x));
+    }
+
     self.bus.add(base, VIRTIO_SIZE, Transport::new(dev, self.mem.clone(), irq));
     self.virtio.push((base, intid));
   }
@@ -445,6 +455,7 @@ impl Machine {
         }
 
         // HVC returns to the next instruction already; SMC (trapped) does not.
+        0x16 if cpu.reg(hv::REG_X0) as u32 == HVC_QUEUE => self.serve_queue(cpu),
         0x16 => {
           if let Some(next) = self.psci(cpu)? {
             return Ok(next);
@@ -512,6 +523,13 @@ impl Machine {
     }
 
     Ok(())
+  }
+
+  /// HVC_QUEUE: x1 is the device's MMIO base, x2 the queue; x0 gets 0 once it is served.
+  fn serve_queue(&self, cpu: &hv::Cpu) {
+    let (base, queue) = (cpu.reg(hv::REG_X0 + 1), cpu.reg(hv::REG_X0 + 2) as u16);
+    let done = self.calls.iter().any(|(b, f)| *b == base && f(queue));
+    cpu.set_reg(hv::REG_X0, if done { 0 } else { -1i64 as u64 });
   }
 
   /// PSCI 0.2 over HVC: https://developer.arm.com/documentation/den0022

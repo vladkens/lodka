@@ -6,6 +6,7 @@
 pub mod blk;
 pub mod console;
 mod fdt;
+pub mod fs;
 mod hv;
 pub mod machine;
 mod mem;

@@ -6,7 +6,7 @@
 mod agent;
 mod sys;
 
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -106,6 +106,7 @@ fn boot() -> io::Result<()> {
   }
 
   var()?;
+  shares();
   host_key()?;
   run("ip", &["link", "set", "lo", "up"])?;
   run("ip", &["link", "set", "eth0", "up"])?;
@@ -148,6 +149,33 @@ fn var() -> io::Result<()> {
   // root's home keeps what a person leaves there.
   fs::create_dir_all("/var/lib/lodka/root")?;
   mount("/var/lib/lodka/root", "/root", "", libc::MS_BIND, "")
+}
+
+/// The Mac's folders lodka shares, each at the path its tag names (`/Users`): virtio-fs devices
+/// list their tags in sysfs. Each file shows whoever asks as its owner, and macOS checks access
+/// as the Mac user (`caller_owns`, guest/patches); no setuid file there runs as root.
+/// Readahead goes past the kernel's 128 KiB, which halves a sequential read's speed: up to
+/// four requests of the largest size, 1 MiB, in flight.
+fn shares() {
+  let Ok(dirs) = fs::read_dir("/sys/fs/virtiofs") else { return };
+  for x in dirs.flatten() {
+    let Ok(tag) = fs::read_to_string(x.path().join("tag")) else { continue };
+    let tag = tag.trim();
+    if !tag.starts_with('/') {
+      continue;
+    }
+
+    if let Err(e) = mount(tag, tag, "virtiofs", NOSUID | NODEV, "caller_owns") {
+      log!("{tag}: {e}");
+      continue;
+    }
+
+    let Ok(dev) = fs::metadata(tag).map(|x| x.dev()) else { continue };
+    let bdi = format!("/sys/class/bdi/{}:{}/read_ahead_kb", libc::major(dev), libc::minor(dev));
+    if let Err(e) = fs::write(&bdi, "4096") {
+      log!("{bdi}: {e}");
+    }
+  }
 }
 
 /// Whether lodka says the data disk is blank, none of it on the Mac yet: a disk only gets a file

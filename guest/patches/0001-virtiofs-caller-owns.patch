@@ -1,0 +1,106 @@
+virtiofs: caller_owns, for a server that answers as one host user
+
+lodka serves the Mac's files as the Mac user: macOS checks every access, and the uid and gid a
+file has on the Mac mean nothing in the guest. With caller_owns the guest checks no permissions
+of its own (no default_permissions) and shows each file as owned by whoever asks, so one
+process's view isn't cached for another and tools that check the owner (git, ssh, npm) accept
+the files, as with Virtualization.framework's shares.
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 9e20bc9..55ef716 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -2190,6 +2190,7 @@ static int fuse_getattr(struct mnt_idmap *idmap,
+ {
+ 	struct inode *inode = d_inode(path->dentry);
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
++	int err;
+ 
+ 	if (fuse_is_bad(inode))
+ 		return -EIO;
+@@ -2207,7 +2208,13 @@ static int fuse_getattr(struct mnt_idmap *idmap,
+ 		return -EACCES;
+ 	}
+ 
+-	return fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags);
++	err = fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags);
++	if (!err && fc->caller_owns) {
++		stat->uid = current_fsuid();
++		stat->gid = current_fsgid();
++	}
++
++	return err;
+ }
+ 
+ static const struct inode_operations fuse_dir_inode_operations = {
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 7d26159..a0508bb 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -549,6 +549,7 @@ struct fuse_fs_context {
+ 	bool group_id_present:1;
+ 	bool default_permissions:1;
+ 	bool allow_other:1;
++	bool caller_owns:1;
+ 	bool destroy:1;
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+@@ -800,6 +801,9 @@ struct fuse_conn {
+ 	/** Check permissions based on the file mode or not? */
+ 	unsigned default_permissions:1;
+ 
++	/** Show every file as owned by whoever asks; the server checks access (virtiofs) */
++	unsigned caller_owns:1;
++
+ 	/** Allow other than the mounter user to access the filesystem ? */
+ 	unsigned allow_other:1;
+ 
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index 7075984..c135d0d 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -110,11 +110,13 @@ static const struct constant_table dax_param_enums[] = {
+ enum {
+ 	OPT_DAX,
+ 	OPT_DAX_ENUM,
++	OPT_CALLER_OWNS,
+ };
+ 
+ static const struct fs_parameter_spec virtio_fs_parameters[] = {
+ 	fsparam_flag("dax", OPT_DAX),
+ 	fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
++	fsparam_flag("caller_owns", OPT_CALLER_OWNS),
+ 	{}
+ };
+ 
+@@ -136,6 +138,9 @@ static int virtio_fs_parse_param(struct fs_context *fsc,
+ 	case OPT_DAX_ENUM:
+ 		ctx->dax_mode = result.uint_32;
+ 		break;
++	case OPT_CALLER_OWNS:
++		ctx->caller_owns = true;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1597,6 +1602,12 @@ static int virtio_fs_fill_super(struct super_block *sb, struct fs_context *fsc)
+ 	int err;
+ 
+ 	virtio_fs_ctx_set_defaults(ctx);
++	/*
++	 * A server that answers as one host user, whoever asks: the guest shows each caller as the
++	 * owner, so one caller's view isn't cached for another, and the host checks access.
++	 */
++	if (ctx->caller_owns)
++		ctx->default_permissions = 0;
+ 	mutex_lock(&virtio_fs_mutex);
+ 
+ 	/* After holding mutex, make sure virtiofs device is still there.
+@@ -1633,6 +1644,7 @@ static int virtio_fs_fill_super(struct super_block *sb, struct fs_context *fsc)
+ 	err = fuse_fill_super_common(sb, ctx);
+ 	if (err < 0)
+ 		goto err_free_fuse_devs;
++	fc->caller_owns = ctx->caller_owns;
+ 
+ 	for (i = 0; i < fs->nvqs; i++) {
+ 		struct virtio_fs_vq *fsvq = &fs->vqs[i];
