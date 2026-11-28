@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # edited: a PR renamed to `release: vX.Y.Z` gets the release jobs too.
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 permissions:
