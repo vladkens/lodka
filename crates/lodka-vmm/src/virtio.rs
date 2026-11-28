@@ -325,10 +325,15 @@ pub fn worker(
 ) -> io::Result<()> {
   let label = name.to_string();
   let run = move || {
+    let mut errors = 0u64;
     loop {
       wake.wait(None);
+      // A queue the guest broke fails on each notify: the log gets the 1st, 2nd, 4th error...
       if let Err(e) = serve() {
-        eprintln!("lodka: {label}: {e}");
+        errors += 1;
+        if errors.is_power_of_two() {
+          eprintln!("lodka: {label}: {e} ({errors} so far)");
+        }
       }
     }
   };

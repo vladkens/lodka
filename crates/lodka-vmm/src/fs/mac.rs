@@ -153,55 +153,57 @@ pub fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Entry> {
   parse(bytes)
 }
 
-/// The entries of the directory open as `fd`, without `.` and `..`, from its start.
-pub fn list(fd: RawFd) -> io::Result<Vec<Entry>> {
-  // SAFETY: lseek on an open directory: getattrlistbulk starts again only from 0.
+/// The directory open as `fd` listed again from its start: getattrlistbulk starts again only
+/// from 0.
+pub fn rewind(fd: RawFd) -> io::Result<()> {
+  // SAFETY: lseek on an open directory.
   if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
     return Err(io::Error::last_os_error());
   }
 
+  Ok(())
+}
+
+/// The next entries of the directory open as `fd`, without `.` and `..`, onto `out`: one call's
+/// worth; false at its end.
+pub fn list(fd: RawFd, out: &mut Vec<Entry>) -> io::Result<bool> {
   let al = attrlist(true);
-  let mut buf = vec![0u64; 16 * 1024]; // 128 KiB: about 800 entries a call
+  let mut buf = vec![0u64; 4 * 1024]; // 32 KiB: about 200 entries
   let size = buf.len() * 8;
-  let mut out = Vec::new();
-  loop {
-    // SAFETY: getattrlistbulk writes at most `size` bytes into the buffer.
-    let n = unsafe {
-      libc::getattrlistbulk(
-        fd,
-        (&al as *const libc::attrlist).cast_mut().cast(),
-        buf.as_mut_ptr().cast(),
-        size,
-        0,
-      )
-    };
-    if n < 0 {
-      return Err(io::Error::last_os_error());
-    }
-
-    if n == 0 {
-      return Ok(out);
-    }
-
-    // SAFETY: as in stat_at.
-    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), size) };
-    let mut at = 0;
-    for _ in 0..n {
-      let len = Reader { rec: &bytes[at..], at: 0 }.u32() as usize;
-      if len < 4 || at + len > size {
-        return Err(io::Error::other("getattrlistbulk: a record past the buffer"));
-      }
-
-      match parse(&bytes[at..at + len]) {
-        Ok(x) => out.push(x),
-        // Gone between the listing and its attributes.
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
-        Err(e) => return Err(e),
-      }
-
-      at += len;
-    }
+  // SAFETY: getattrlistbulk writes at most `size` bytes into the buffer.
+  let n = unsafe {
+    libc::getattrlistbulk(
+      fd,
+      (&al as *const libc::attrlist).cast_mut().cast(),
+      buf.as_mut_ptr().cast(),
+      size,
+      0,
+    )
+  };
+  if n < 0 {
+    return Err(io::Error::last_os_error());
   }
+
+  // SAFETY: as in stat_at.
+  let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), size) };
+  let mut at = 0;
+  for _ in 0..n {
+    let len = Reader { rec: &bytes[at..], at: 0 }.u32() as usize;
+    if len < 4 || at + len > size {
+      return Err(io::Error::other("getattrlistbulk: a record past the buffer"));
+    }
+
+    match parse(&bytes[at..at + len]) {
+      Ok(x) => out.push(x),
+      // Gone between the listing and its attributes.
+      Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+      Err(e) => return Err(e),
+    }
+
+    at += len;
+  }
+
+  Ok(n > 0)
 }
 
 /// Reads a record's fields in the order of their bits, each present only when the returned
@@ -517,7 +519,9 @@ mod tests {
     let e = stat_at(dir.as_raw_fd(), c"nope").unwrap_err();
     assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
 
-    let mut names: Vec<_> = list(dir.as_raw_fd()).unwrap().into_iter().map(|x| x.0).collect();
+    let mut all = Vec::new();
+    while list(dir.as_raw_fd(), &mut all).unwrap() {}
+    let mut names: Vec<_> = all.into_iter().map(|x| x.0).collect();
     names.sort();
     assert_eq!(names, [b"File.txt".to_vec(), b"link".to_vec(), b"sub".to_vec()]);
 

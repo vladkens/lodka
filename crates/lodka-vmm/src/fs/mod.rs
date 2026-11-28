@@ -230,11 +230,9 @@ impl Device for Fs {
       0 => self.wakes[0].wake(),
       1 if first == 2 => self.notes.wake.wake(),
       q if q < first + self.queues => self.wakes[q + 1 - first].wake(),
-      _ => {
-        if let Some(x) = self.sync.get() {
-          x.serve(&self.server, queue);
-        }
-      }
+      // A sync queue is served in the guest's hypercall (`call`) only: here it would be served
+      // under the transport's lock, which every vCPU takes to reach the device.
+      _ => {}
     }
   }
 
