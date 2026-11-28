@@ -752,6 +752,12 @@ impl Server {
       x => Arc::new(x?),
     };
 
+    // Kept only while FSEvents tells of the moves that drop it: else one moved out of the share
+    // would still lead there.
+    if !self.watched.load(Ordering::Relaxed) {
+      return Ok(fd);
+    }
+
     let mut dirs = self.dirs.lock().unwrap();
     if dirs.len() >= DIRS {
       dirs.retain(|&x, _| x == abi::ROOT_ID);
@@ -800,7 +806,7 @@ impl Server {
     fd: impl FnOnce(RawFd) -> Result<T, i32>,
     name: impl FnOnce(&CStr) -> Result<T, i32>,
   ) -> Result<T, i32> {
-    if let Some(h) = self.handle_of(id) {
+    if let Some(h) = self.handle_of(id, false) {
       return fd(h.fd.as_raw_fd());
     }
 
@@ -821,7 +827,7 @@ impl Server {
     let st = self.path(id).and_then(|x| mac::lstat(&x).map_err(err)).and_then(|x| self.same(id, x));
     match st {
       Err(ESTALE | ENOENT) => {
-        let h = self.handle_of(id).ok_or(ESTALE)?;
+        let h = self.handle_of(id, false).ok_or(ESTALE)?;
         mac::fstat(h.fd.as_raw_fd()).map_err(err)
       }
       x => x,
@@ -939,9 +945,12 @@ impl Server {
     self.handles.lock().unwrap().get(&fh).cloned().ok_or(EINVAL)
   }
 
-  /// A file the guest has open for the node, if any.
-  fn handle_of(&self, id: u64) -> Option<Arc<Handle>> {
-    self.handles.lock().unwrap().values().find(|x| x.node == id).cloned()
+  /// A file the guest has open for the node, if any: one open for writing, with `write`.
+  fn handle_of(&self, id: u64, write: bool) -> Option<Arc<Handle>> {
+    // SAFETY: fcntl on an open file.
+    let writes = |x: &Handle| unsafe { libc::fcntl(x.fd.as_raw_fd(), libc::F_GETFL) } & 3 != 0;
+    let handles = self.handles.lock().unwrap();
+    handles.values().find(|x| x.node == id && (!write || writes(x))).cloned()
   }
 
   /// The open flags for the guest's file: FOPEN_KEEP_CACHE when it is as the guest last saw it,
@@ -1120,6 +1129,7 @@ impl Server {
     let id = r.h.nodeid;
     let node = self.node(id)?;
     let v = x.valid;
+
     // By a descriptor, as a name may lead to another file by the time it is used: the guest's
     // open file, one opened to truncate, which needs write permission anyway, or one opened for
     // this alone. By the name only where none opens.
@@ -1128,10 +1138,19 @@ impl Server {
       handle = self.handle_fd(x.fh)?;
       handle.fd.as_raw_fd()
     } else if v & abi::FATTR_SIZE != 0 && node.kind == S_IFREG {
-      // No I/O through it: it may stay non-blocking.
-      file = self.open_node(id, libc::O_WRONLY | libc::O_NONBLOCK)?;
-      file.as_raw_fd()
-    } else if let Some(h) = self.handle_of(id) {
+      // No I/O through it: it may stay non-blocking. With no name left, by the guest's file open
+      // for writing, as truncate on /proc/self/fd.
+      match self.open_node(id, libc::O_WRONLY | libc::O_NONBLOCK) {
+        Err(ESTALE) => {
+          handle = self.handle_of(id, true).ok_or(ESTALE)?;
+          handle.fd.as_raw_fd()
+        }
+        x => {
+          file = x?;
+          file.as_raw_fd()
+        }
+      }
+    } else if let Some(h) = self.handle_of(id, false) {
       handle = h;
       handle.fd.as_raw_fd()
     } else if let Some(x) = self.open_any(id, node.kind)? {
@@ -2370,6 +2389,7 @@ mod tests {
     let mut t = T::new("unlinked");
     std::fs::write(t.dir.join("f"), b"12345").unwrap();
     let f = t.lookup(abi::ROOT_ID, "f").unwrap().nodeid;
+    let ro = open_fh(&mut t, abi::OPEN, f, 0).unwrap();
     let fh = open_fh(&mut t, abi::OPEN, f, 2).unwrap();
     assert_eq!(t.call(abi::UNLINK, abi::ROOT_ID, &z("f"), 0).0, 0);
     let (e, b) = t.call(abi::GETATTR, f, abi::bytes(&abi::GetattrIn::default()), 256);
@@ -2380,8 +2400,16 @@ mod tests {
     let (e, b) = t.call(abi::SETATTR, f, abi::bytes(&sa), 256);
     assert_eq!((e, abi::read::<abi::AttrOut>(&b).unwrap().attr.mode & 0o7777), (0, 0o640));
 
-    let rl = abi::ReleaseIn { fh, ..Default::default() };
-    t.call(abi::RELEASE, f, abi::bytes(&rl), 0);
+    // Nor truncate on /proc/self/fd, done by the file open for writing.
+    let sa = abi::SetattrIn { valid: abi::FATTR_SIZE, size: 2, ..Default::default() };
+    let (e, b) = t.call(abi::SETATTR, f, abi::bytes(&sa), 256);
+    assert_eq!((e, abi::read::<abi::AttrOut>(&b).unwrap().attr.size), (0, 2));
+
+    for fh in [ro, fh] {
+      let rl = abi::ReleaseIn { fh, ..Default::default() };
+      t.call(abi::RELEASE, f, abi::bytes(&rl), 0);
+    }
+
     let (e, _) = t.call(abi::GETATTR, f, abi::bytes(&abi::GetattrIn::default()), 256);
     assert_eq!(e, -ESTALE);
   }
@@ -2464,6 +2492,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     let mut t = T::new("search");
+    t.s.watched();
     let mode = |t: &T, x: &str, m| {
       std::fs::set_permissions(t.dir.join(x), std::fs::Permissions::from_mode(m)).unwrap()
     };
@@ -2564,6 +2593,22 @@ mod tests {
 
     let rd = abi::ReadIn { fh, size: 4096, ..Default::default() };
     assert_eq!(t.call(abi::READDIRPLUS, d, abi::bytes(&rd), 4096).0, -ESTALE);
+    let _ = std::fs::remove_dir_all(&out);
+  }
+
+  /// With no FSEvents to tell of moves, no descriptor is kept for a folder: one moved out of the
+  /// share is not worked in.
+  #[test]
+  fn unwatched_folders_moved_out_are_gone() {
+    let mut t = T::new("moved-unwatched");
+    let out = outside(&t);
+    std::fs::create_dir(t.dir.join("d")).unwrap();
+    let d = t.lookup(abi::ROOT_ID, "d").unwrap().nodeid;
+    let c = abi::CreateIn { flags: 0o102, mode: 0o100644, ..Default::default() }; // O_CREAT|O_RDWR
+    assert_eq!(t.call(abi::CREATE, d, &cat(&[abi::bytes(&c), &z("a")]), 256).0, 0);
+    std::fs::rename(t.dir.join("d"), out.join("d")).unwrap();
+    assert_eq!(t.call(abi::CREATE, d, &cat(&[abi::bytes(&c), &z("b")]), 256).0, -ESTALE);
+    assert!(!out.join("d/b").exists());
     let _ = std::fs::remove_dir_all(&out);
   }
 
