@@ -72,6 +72,8 @@ pub struct Server {
   dirs: Mutex<HashMap<u64, Arc<OwnedFd>>>,
   /// FSEvents tells the guest what changes on the Mac.
   watched: AtomicBool,
+  /// The changes FSEvents saw so far: what was listed before the last is no longer news.
+  changes: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -108,15 +110,19 @@ struct Handle {
 #[derive(Default)]
 struct Listing {
   base: usize,
-  entries: Vec<Entry>,
+  /// Each with the count of the Mac's changes before it was listed.
+  entries: Vec<(Entry, u64)>,
   done: bool,
   /// Where the descriptor is is unknown after an error: listed again from the start.
   lost: bool,
 }
 
 impl Listing {
-  fn more(&mut self, fd: RawFd) -> Result<(), i32> {
-    let r = mac::list(fd, &mut self.entries);
+  /// The next entries, listed after `changes` changes.
+  fn more(&mut self, fd: RawFd, changes: u64) -> Result<(), i32> {
+    let mut new = Vec::new();
+    let r = mac::list(fd, &mut new);
+    self.entries.extend(new.into_iter().map(|x| (x, changes)));
     self.done = !matches!(r, Ok(true));
     self.lost = r.is_err();
     r.map(|_| ()).map_err(err)
@@ -185,6 +191,7 @@ impl Server {
       next_fh: AtomicU64::new(1),
       dirs: Mutex::new(HashMap::from([(abi::ROOT_ID, Arc::new(fd))])),
       watched: AtomicBool::new(false),
+      changes: AtomicU64::new(0),
     })
   }
 
@@ -213,10 +220,16 @@ impl Server {
     const NAME: u32 = CREATED | MOVED;
     const DATA: u32 = 0x1000;
     const IS_DIR: u32 = 0x20000;
+    // Its mode, ACL or owner changed.
+    const META: u32 = 0x400 | 0x4000;
 
-    // A directory moved, maybe out of the share: a descriptor kept for lookups in it would still
-    // lead there. The others are opened again as needed.
-    if flags & LOST != 0 || (flags & MOVED != 0 && flags & IS_DIR != 0) {
+    // Counted before the guest hears of it: a listing's attributes from before are old then.
+    self.changes.fetch_add(1, Ordering::SeqCst);
+
+    // A directory moved, maybe out of the share, or its permissions changed: a descriptor kept
+    // for lookups in it, or in one under it, would still lead there as before. The others are
+    // opened again as needed.
+    if flags & LOST != 0 || (flags & IS_DIR != 0 && flags & (MOVED | META) != 0) {
       self.dirs.lock().unwrap().retain(|&x, _| x == abi::ROOT_ID);
     }
 
@@ -1277,6 +1290,7 @@ impl Server {
     // Moved out of the share on the Mac while open, it is no longer the guest's to list.
     self.path(h.node)?;
     let fd = h.fd.as_raw_fd();
+    let changes = self.changes.load(Ordering::SeqCst);
     let mut list = h.list.lock().unwrap();
     // An offset is the index of the next entry, `.` and `..` first. The handle keeps only what
     // the guest is about to read: from the start or from before that, it is listed again.
@@ -1296,7 +1310,7 @@ impl Server {
         break;
       }
 
-      l.more(fd)?;
+      l.more(fd, changes)?;
     }
 
     let me = mac::fstat(fd).map_err(err)?;
@@ -1310,16 +1324,16 @@ impl Server {
           break;
         }
 
-        l.more(fd)?;
+        l.more(fd, changes)?;
         continue;
       }
 
-      let (name, st): (&[u8], &Stat) = match i {
-        0 => (b".", &me),
-        1 => (b"..", &me),
+      let (name, st, fresh): (&[u8], &Stat, _) = match i {
+        0 => (b".", &me, false),
+        1 => (b"..", &me, false),
         _ => {
-          let (name, st) = &l.entries[i - 2 - l.base];
-          (name, st)
+          let ((name, st), seen) = &l.entries[i - 2 - l.base];
+          (name, st, *seen == changes)
         }
       };
 
@@ -1330,9 +1344,13 @@ impl Server {
 
       if plus {
         // `.` and `..` get no entry: the kernel counts no lookup for them; nor does a file past
-        // the nodes' limit.
-        let e =
-          if i < 2 { abi::EntryOut::default() } else { self.entry(st, me.dev).unwrap_or_default() };
+        // the nodes' limit, nor one listed before a change the guest heard of since, whose
+        // attributes it would keep.
+        let e = match fresh {
+          true => self.entry(st, me.dev).unwrap_or_default(),
+          false => abi::EntryOut::default(),
+        };
+
         out.extend_from_slice(abi::bytes(&e));
       }
 
@@ -2610,6 +2628,68 @@ mod tests {
     assert_eq!(t.call(abi::CREATE, d, &cat(&[abi::bytes(&c), &z("b")]), 256).0, -ESTALE);
     assert!(!out.join("d/b").exists());
     let _ = std::fs::remove_dir_all(&out);
+  }
+
+  /// A folder whose mode changes on the Mac is opened again for what is in it, and in folders
+  /// under it: a descriptor kept from before would skip the permission it takes away.
+  #[test]
+  fn folders_under_a_chmod_are_opened_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut t = T::new("chmod-above");
+    t.s.watched();
+    std::fs::create_dir_all(t.dir.join("p/c")).unwrap();
+    let p = t.lookup(abi::ROOT_ID, "p").unwrap().nodeid;
+    let c = t.lookup(p, "c").unwrap().nodeid;
+    let mk = abi::MkdirIn { mode: 0o755, umask: 0 };
+    assert_eq!(t.call(abi::MKDIR, c, &cat(&[abi::bytes(&mk), &z("a")]), 256).0, 0);
+
+    let mode = |m| std::fs::Permissions::from_mode(m);
+    std::fs::set_permissions(t.dir.join("p"), mode(0o000)).unwrap();
+    let path = t.dir.canonicalize().unwrap().join("p").into_os_string().into_vec();
+    t.s.changed(&path, 0x400 | 0x20000);
+    let e = t.call(abi::MKDIR, c, &cat(&[abi::bytes(&mk), &z("b")]), 256).0;
+    std::fs::set_permissions(t.dir.join("p"), mode(0o755)).unwrap();
+    assert_eq!(e, -EACCES);
+  }
+
+  /// READDIRPLUS gives no attributes listed before a change on the Mac the guest has heard of:
+  /// it would keep them.
+  #[test]
+  fn listings_give_no_attributes_older_than_a_change() {
+    let mut t = T::new("listed-before");
+    t.s.watched();
+    for i in 0..40 {
+      std::fs::write(t.dir.join(format!("f{i:02}")), b"1").unwrap();
+    }
+
+    let fh = open_fh(&mut t, abi::OPENDIR, abi::ROOT_ID, 0).unwrap();
+    let read = |t: &mut T, offset| {
+      let rd = abi::ReadIn { fh, offset, size: 1024, ..Default::default() };
+      let (e, b) = t.call(abi::READDIRPLUS, abi::ROOT_ID, abi::bytes(&rd), 1024);
+      assert_eq!(e, 0);
+      let mut at = 0;
+      let mut got = Vec::new();
+      while at < b.len() {
+        let entry: abi::EntryOut = abi::read(&b[at..]).unwrap();
+        let d: abi::Dirent = abi::read(&b[at + size_of::<abi::EntryOut>()..]).unwrap();
+        got.push((d.off, entry.nodeid, entry.attr.size));
+        at += abi::direntplus_size(d.namelen as usize);
+      }
+
+      got
+    };
+
+    let first = read(&mut t, 0);
+    assert!(first.iter().skip(2).all(|x| x.1 != 0 && x.2 == 1));
+    for i in 0..40 {
+      std::fs::write(t.dir.join(format!("f{i:02}")), b"12").unwrap();
+    }
+
+    let path = t.dir.canonicalize().unwrap().join("f00").into_os_string().into_vec();
+    t.s.changed(&path, 0x1000);
+    let next = read(&mut t, first.last().unwrap().0);
+    assert!(!next.is_empty() && next.iter().all(|x| x.1 == 0));
   }
 
   /// A file removed while open keeps its extended attributes for the guest.
