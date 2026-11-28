@@ -8,11 +8,13 @@ what the guest cached, as the /dev/fuse notifications do, and tells fsnotify, so
 watchers in the guest see changes made on the Mac. The guest can then cache names and
 attributes for long.
 
-Two flags of lodka's own. VIRTIO_FS_INVAL_MODIFIED on an INVAL_ENTRY, for a file the guest
+Three flags of lodka's own. VIRTIO_FS_INVAL_MODIFIED on an INVAL_ENTRY, for a file the guest
 never looked up whose contents changed, has the guest look it up if inotify watches its
-directory, and tell inotify. FOPEN_INVAL_ATTR on an open, for a file changed since the guest
-last got its attributes, has them fetched there: a notification still on its way would leave
-the old size, and a splice reads up to it.
+directory, and tell inotify. VIRTIO_FS_INVAL_DIR on an INVAL_ENTRY, or in a DELETE's padding,
+says the name is a directory's, for IN_ISDIR: the guest has no inode for a name just made or
+removed. FOPEN_INVAL_ATTR on an open, for a file changed since the guest last got its
+attributes, has them fetched there: a notification still on its way would leave the old size,
+and a splice reads up to it.
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
 index dc61efd..ae0921c 100644
 --- a/fs/fuse/file.c
@@ -30,7 +32,7 @@ index dc61efd..ae0921c 100644
  			truncate_pagecache(inode, 0);
  		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
 diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
-index c135d0d..5a56356 100644
+index c135d0d..cd527f6 100644
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
 @@ -6,6 +6,9 @@
@@ -81,7 +83,7 @@ index c135d0d..5a56356 100644
  			if (first)
  				ret = snprintf(buf + pos, size - pos, "%u", cpu);
  			else
-@@ -909,6 +918,226 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
+@@ -909,6 +918,223 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
  	spin_unlock(&fsvq->lock);
  }
  
@@ -162,8 +164,8 @@ index c135d0d..5a56356 100644
 +static void virtio_fs_inval_entry(struct fuse_conn *fc, int code, void *arg,
 +				  unsigned int size)
 +{
-+	__u32 mask = FS_CREATE, namelen, flags = 0;
-+	struct inode *dir, *inode;
++	__u32 mask = FS_CREATE, namelen, flags;
++	struct inode *dir;
 +	u64 parent, child = 0;
 +	unsigned int hdr;
 +	struct qstr name;
@@ -178,6 +180,7 @@ index c135d0d..5a56356 100644
 +		parent = o->parent;
 +		child = o->child;
 +		namelen = o->namelen;
++		flags = o->padding;
 +		mask = FS_DELETE;
 +	} else {
 +		struct fuse_notify_inval_entry_out *o = arg;
@@ -200,14 +203,10 @@ index c135d0d..5a56356 100644
 +		return;
 +	}
 +
-+	if (child) {
-+		inode = fuse_ilookup(fc, child, NULL);
-+		if (inode && S_ISDIR(inode->i_mode))
-+			mask |= FS_ISDIR;
-+		iput(inode);
-+	}
++	if (flags & VIRTIO_FS_INVAL_DIR)
++		mask |= FS_ISDIR;
 +
-+	fuse_reverse_inval_entry(fc, parent, child, &name, flags);
++	fuse_reverse_inval_entry(fc, parent, child, &name, flags & FUSE_EXPIRE_ONLY);
 +	dir = fuse_ilookup(fc, parent, NULL);
 +	if (!dir)
 +		return;
@@ -308,7 +307,7 @@ index c135d0d..5a56356 100644
  static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *fs)
  {
  	const struct cpumask *mask, *masks;
-@@ -921,12 +1150,12 @@ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *f
+@@ -921,12 +1147,12 @@ static void virtio_fs_map_queues(struct virtio_device *vdev, struct virtio_fs *f
  		goto fallback;
  
  	for (q = 0; q < fs->num_request_queues; q++) {
@@ -323,7 +322,7 @@ index c135d0d..5a56356 100644
  	}
  
  	return;
-@@ -936,13 +1165,13 @@ fallback:
+@@ -936,13 +1162,13 @@ fallback:
  	/* If even this fails we default to all CPUs use first request queue */
  	if (!masks) {
  		for_each_possible_cpu(cpu)
@@ -339,7 +338,7 @@ index c135d0d..5a56356 100644
  	}
  	kfree(masks);
  }
-@@ -970,6 +1199,10 @@ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
+@@ -970,6 +1196,10 @@ static void virtio_fs_init_vq(struct virtio_fs_vq *fsvq, char *name,
  		INIT_WORK(&fsvq->done_work, virtio_fs_requests_done_work);
  		INIT_WORK(&fsvq->dispatch_work,
  				virtio_fs_request_dispatch_work);
@@ -350,7 +349,7 @@ index c135d0d..5a56356 100644
  	} else {
  		INIT_WORK(&fsvq->done_work, virtio_fs_hiprio_done_work);
  		INIT_WORK(&fsvq->dispatch_work,
-@@ -999,7 +1232,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -999,7 +1229,17 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	/* Truncate nr of request queues to nr_cpu_id */
  	fs->num_request_queues = min_t(unsigned int, fs->num_request_queues,
  					nr_cpu_ids);
@@ -369,7 +368,7 @@ index c135d0d..5a56356 100644
  	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
  	if (!fs->vqs)
  		return -ENOMEM;
-@@ -1018,11 +1261,18 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1018,11 +1258,18 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	virtio_fs_init_vq(&fs->vqs[VQ_HIPRIO], "hiprio", VQ_HIPRIO);
  	vqs_info[VQ_HIPRIO].name = fs->vqs[VQ_HIPRIO].name;
  
@@ -390,7 +389,7 @@ index c135d0d..5a56356 100644
  		virtio_fs_init_vq(&fs->vqs[i], vq_name, VQ_REQUEST);
  		vqs_info[i].callback = virtio_fs_vq_done;
  		vqs_info[i].name = fs->vqs[i].name;
-@@ -1200,6 +1450,10 @@ static int virtio_fs_probe(struct virtio_device *vdev)
+@@ -1200,6 +1447,10 @@ static int virtio_fs_probe(struct virtio_device *vdev)
  	 */
  	virtio_device_ready(vdev);
  
@@ -401,7 +400,7 @@ index c135d0d..5a56356 100644
  	ret = virtio_fs_add_instance(vdev, fs);
  	if (ret < 0)
  		goto out_vqs;
-@@ -1271,7 +1525,7 @@ static const struct virtio_device_id id_table[] = {
+@@ -1271,7 +1522,7 @@ static const struct virtio_device_id id_table[] = {
  	{},
  };
  
@@ -410,7 +409,7 @@ index c135d0d..5a56356 100644
  
  static struct virtio_driver virtio_fs_driver = {
  	.driver.name		= KBUILD_MODNAME,
-@@ -1738,7 +1992,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+@@ -1738,7 +1989,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
  	mutex_lock(&virtio_fs_mutex);
  	fs = virtio_fs_find_instance(fsc->source);
  	if (fs)
@@ -433,10 +432,10 @@ index c13e1f9..4729fc2 100644
  /**
   * INIT request/reply flags
 diff --git a/include/uapi/linux/virtio_fs.h b/include/uapi/linux/virtio_fs.h
-index bea3829..3156fd0 100644
+index bea3829..3db0e7e 100644
 --- a/include/uapi/linux/virtio_fs.h
 +++ b/include/uapi/linux/virtio_fs.h
-@@ -14,8 +14,20 @@ struct virtio_fs_config {
+@@ -14,8 +14,26 @@ struct virtio_fs_config {
  
  	/* Number of request queues */
  	__le32 num_request_queues;
@@ -453,6 +452,12 @@ index bea3829..3156fd0 100644
 + * guest has no inode for it; only inotify is told, if it watches the directory
 + */
 +#define VIRTIO_FS_INVAL_MODIFIED	(1U << 31)
++
++/*
++ * In a fuse_notify_inval_entry_out's flags or a fuse_notify_delete_out's padding: the name is a
++ * directory's, for inotify's IN_ISDIR
++ */
++#define VIRTIO_FS_INVAL_DIR		(1U << 30)
 +
  /* For the id field in virtio_pci_shm_cap */
  #define VIRTIO_FS_SHMCAP_ID_CACHE 0

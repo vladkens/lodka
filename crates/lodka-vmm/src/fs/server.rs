@@ -90,6 +90,8 @@ struct Nodes {
 
 struct Handle {
   fd: OwnedFd,
+  /// The node it is open for.
+  node: u64,
   list: Mutex<Listing>,
 }
 
@@ -149,7 +151,7 @@ impl Server {
     let root = CString::new(root.canonicalize()?.into_os_string().into_vec())?;
     // `open` gives Linux's errno, for the guest; errno is still macOS's.
     let fd =
-      open(&root, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|_| io::Error::last_os_error())?;
+      open(&root, libc::O_SEARCH | libc::O_DIRECTORY).map_err(|_| io::Error::last_os_error())?;
     let st = mac::fstat(fd.as_raw_fd())?;
     let node = Node { dev: st.dev, ino: st.ino, kind: S_IFDIR, refs: 1, seen: None };
     let nodes = Nodes {
@@ -219,10 +221,13 @@ impl Server {
       return Vec::new();
     }
 
+    // For inotify's IN_ISDIR: the guest has no inode for a name made or removed.
+    let is_dir = if flags & IS_DIR != 0 { abi::INVAL_DIR } else { 0 };
     let parent = lstat(dir).and_then(|st| self.known(&st));
     let Some(st) = lstat(path) else {
       let Some(parent) = parent else { return Vec::new() };
-      let x = abi::NotifyDeleteOut { parent, child: 0, namelen: name.len() as u32, padding: 0 };
+      let namelen = name.len() as u32;
+      let x = abi::NotifyDeleteOut { parent, child: 0, namelen, padding: is_dir };
       return vec![note(abi::NOTIFY_DELETE, &[abi::bytes(&x), name, &[0]])];
     };
 
@@ -242,9 +247,9 @@ impl Server {
     };
 
     // FSEvents keeps a file's Created flag on its later events: a name for a node the guest
-    // has is not new, unless it was moved.
-    if flags & MOVED != 0 || (flags & CREATED != 0 && known.is_none()) {
-      entry(0);
+    // has is not new, unless it was moved or is a hard link's.
+    if flags & MOVED != 0 || (flags & CREATED != 0 && (known.is_none() || st.nlink > 1)) {
+      entry(is_dir);
     }
 
     // A known file's modification reaches its directory's watchers through its inode.
@@ -390,11 +395,14 @@ impl Server {
         let x: abi::MkdirIn = arg(r.args, 0)?;
         let (name, _) = name(r.args, size_of::<abi::MkdirIn>())?;
         let dir = self.dir(id)?;
+        let mode = (x.mode & 0o7777) as u16;
         // SAFETY: a NUL-terminated name in an open directory.
-        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), (x.mode & 0o7777) as u16) } != 0 {
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) } != 0 {
           return Err(os());
         }
 
+        // SAFETY: as for mkdirat. The mode as the guest asks, as in CREATE.
+        unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) };
         self.entry_at(id, &dir, name)
       }
       abi::UNLINK | abi::RMDIR => {
@@ -486,7 +494,7 @@ impl Server {
       }
       abi::OPENDIR => {
         let fd = self.open_node(id, libc::O_RDONLY | libc::O_DIRECTORY)?;
-        let fh = self.add_handle(fd)?;
+        let fh = self.add_handle(id, fd)?;
         // Kept across opens while FSEvents tells the guest of changes, which bump its version.
         let keep = if self.watched.load(Ordering::Relaxed) { abi::FOPEN_KEEP_CACHE } else { 0 };
         let open_flags = abi::FOPEN_CACHE_DIR | keep;
@@ -696,9 +704,16 @@ impl Server {
   fn open_node(&self, id: u64, flags: i32) -> Result<OwnedFd, i32> {
     // With O_NONBLOCK a FIFO opens at once, to be refused; with O_DIRECTORY none opens.
     let nonblock = if flags & libc::O_DIRECTORY == 0 { libc::O_NONBLOCK } else { 0 };
-    let fd = open(&self.path(id)?, flags | nonblock)?;
+    // Truncated once known to be the node's file: a rename may have put another in its place.
+    let fd = open(&self.path(id)?, (flags & !libc::O_TRUNC) | nonblock)?;
     let st = self.check(id, fd.as_raw_fd())?;
-    plain(fd, &st, flags)
+    let fd = plain(fd, &st, flags)?;
+    // SAFETY: ftruncate on an open file.
+    if flags & libc::O_TRUNC != 0 && unsafe { libc::ftruncate(fd.as_raw_fd(), 0) } != 0 {
+      return Err(os());
+    }
+
+    Ok(fd)
   }
 
   /// A directory node's descriptor, kept for the next lookup in it.
@@ -707,7 +722,8 @@ impl Server {
       return Ok(x.clone());
     }
 
-    let fd = Arc::new(self.open_node(id, libc::O_RDONLY | libc::O_DIRECTORY)?);
+    // For lookups only: a directory the user may search but not read works too.
+    let fd = Arc::new(self.open_node(id, libc::O_SEARCH | libc::O_DIRECTORY)?);
     let mut dirs = self.dirs.lock().unwrap();
     if dirs.len() >= DIRS {
       dirs.retain(|&x, _| x == abi::ROOT_ID);
@@ -747,14 +763,22 @@ impl Server {
     r
   }
 
-  /// The node's attributes now.
+  /// The node's attributes now: by its path, or, with none left, by a file the guest has open
+  /// for it, as one removed while open.
   fn stat(&self, id: u64) -> Result<Stat, i32> {
     let n = self.node(id)?;
     if n.kind == S_IFDIR {
       return mac::fstat(self.dir(id)?.as_raw_fd()).map_err(err);
     }
 
-    self.same(id, mac::lstat(&self.path(id)?).map_err(err)?)
+    let st = self.path(id).and_then(|x| mac::lstat(&x).map_err(err)).and_then(|x| self.same(id, x));
+    match st {
+      Err(ESTALE | ENOENT) => {
+        let h = self.handle_of(id).ok_or(ESTALE)?;
+        mac::fstat(h.fd.as_raw_fd()).map_err(err)
+      }
+      x => x,
+    }
   }
 
   fn lookup(&self, parent: u64, name: &CStr) -> Res {
@@ -821,20 +845,26 @@ impl Server {
 
   // MARK: Files
 
-  /// The guest's file opened as `fd`; past `max_handles` ENFILE, as from a system with no more.
-  fn add_handle(&self, fd: OwnedFd) -> Result<u64, i32> {
+  /// The guest's file opened as `fd` for `node`; past `max_handles` ENFILE, as from a system
+  /// with no more.
+  fn add_handle(&self, node: u64, fd: OwnedFd) -> Result<u64, i32> {
     let mut handles = self.handles.lock().unwrap();
     if handles.len() >= self.max_handles {
       return Err(ENFILE);
     }
 
     let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-    handles.insert(fh, Arc::new(Handle { fd, list: Mutex::default() }));
+    handles.insert(fh, Arc::new(Handle { fd, node, list: Mutex::default() }));
     Ok(fh)
   }
 
   fn handle_fd(&self, fh: u64) -> Result<Arc<Handle>, i32> {
     self.handles.lock().unwrap().get(&fh).cloned().ok_or(EINVAL)
+  }
+
+  /// A file the guest has open for the node, if any.
+  fn handle_of(&self, id: u64) -> Option<Arc<Handle>> {
+    self.handles.lock().unwrap().values().find(|x| x.node == id).cloned()
   }
 
   /// The open flags for the guest's file: FOPEN_KEEP_CACHE when it is as the guest last saw it,
@@ -860,7 +890,7 @@ impl Server {
     }
 
     let open_flags = self.opened(id, fd.as_raw_fd(), flags)?;
-    let fh = self.add_handle(fd)?;
+    let fh = self.add_handle(id, fd)?;
     reply(&abi::OpenOut { fh, open_flags, ..Default::default() })
   }
 
@@ -868,28 +898,37 @@ impl Server {
     let x: abi::CreateIn = arg(r.args, 0)?;
     let (name, _) = name(r.args, size_of::<abi::CreateIn>())?;
     let dir = self.dir(r.h.nodeid)?;
-    // Another spelling of the name would be opened, and maybe truncated, in its place.
-    if other_spelling(dir.as_raw_fd(), name).is_some() {
-      return Err(EEXIST);
-    }
+    let made = match mac::stat_at(dir.as_raw_fd(), name) {
+      // Another spelling of the name would be opened, and maybe truncated, in its place.
+      Ok((stored, _)) if stored != name.to_bytes() => return Err(EEXIST),
+      Ok(_) => false,
+      Err(_) => true,
+    };
 
     let flags = mac::open_flags(x.flags) | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // A FIFO already there opens at once, as in `open_node`; ESTALE has the guest look it up.
     let fl = flags | libc::O_NONBLOCK;
+    let mode = x.mode & 0o7777;
     // SAFETY: a NUL-terminated name in an open directory.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), fl, x.mode & 0o7777) };
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), fl, mode) };
     if fd < 0 {
       return Err(os());
     }
 
     // SAFETY: a descriptor openat just returned.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The mode as the guest asks, its umask applied: the Mac's umask would take more.
+    if made {
+      // SAFETY: fchmod on an open file.
+      unsafe { libc::fchmod(fd.as_raw_fd(), mode as u16) };
+    }
+
     let st = mac::fstat(fd.as_raw_fd()).map_err(err)?;
     let fd = plain(fd, &st, flags)?;
     let pdev = self.node(r.h.nodeid)?.dev;
     let entry = self.entry(&st, pdev)?;
     let open_flags = self.opened(entry.nodeid, fd.as_raw_fd(), x.flags)?;
-    let fh = self.add_handle(fd).inspect_err(|_| self.forget(entry.nodeid, 1))?;
+    let fh = self.add_handle(entry.nodeid, fd).inspect_err(|_| self.forget(entry.nodeid, 1))?;
     let open = abi::OpenOut { fh, open_flags, ..Default::default() };
     let mut out = abi::bytes(&entry).to_vec();
     out.extend_from_slice(abi::bytes(&open));
@@ -1003,44 +1042,25 @@ impl Server {
     let id = r.h.nodeid;
     let node = self.node(id)?;
     let v = x.valid;
-    if node.kind != S_IFREG && node.kind != S_IFDIR {
-      // A symlink itself, a FIFO or a socket's file, changed by its name: never opened, as a
-      // FIFO's open waits for the other end. A symlink's mode has no meaning, none of them has
-      // a size here, and the owner is fixed.
-      let (dir, name) = self.parent_of(id)?;
-      let (at, file) = (dir.as_raw_fd(), name.as_ptr());
-      let mode = (x.mode & 0o7777) as u16;
-      // SAFETY: a NUL-terminated name in an open directory.
-      if v & abi::FATTR_MODE != 0
-        && node.kind != S_IFLNK
-        && unsafe { libc::fchmodat(at, file, mode, libc::AT_SYMLINK_NOFOLLOW) } != 0
-      {
-        return Err(os());
-      }
-
-      let ts = times(&x);
-      // SAFETY: two timespecs and a NUL-terminated name in an open directory.
-      if v & (abi::FATTR_ATIME | abi::FATTR_MTIME) != 0
-        && unsafe { libc::utimensat(at, file, ts.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0
-      {
-        return Err(os());
-      }
-
-      return self.attr_out(id, &self.stat(id)?);
-    }
-
-    let (handle, dir, file);
+    // The guest's open file, or one opened to truncate, as that needs write permission anyway.
+    // Else by the name: a mode or times need no permission to open the file, and a FIFO's open
+    // waits; by an open file of the guest's only once the name is gone.
+    let (handle, file);
     let fd = if v & abi::FATTR_FH != 0 {
       handle = self.handle_fd(x.fh)?;
       handle.fd.as_raw_fd()
-    } else if node.kind == S_IFDIR {
-      dir = self.dir(id)?;
-      dir.as_raw_fd()
-    } else {
-      let flags = if v & abi::FATTR_SIZE != 0 { libc::O_WRONLY } else { libc::O_RDONLY };
+    } else if v & abi::FATTR_SIZE != 0 && node.kind == S_IFREG {
       // No I/O through it: it may stay non-blocking.
-      file = self.open_node(id, flags | libc::O_NONBLOCK)?;
+      file = self.open_node(id, libc::O_WRONLY | libc::O_NONBLOCK)?;
       file.as_raw_fd()
+    } else {
+      match (self.setattr_at(id, node.kind, &x), self.handle_of(id)) {
+        (Err(ESTALE), Some(h)) => {
+          handle = h;
+          handle.fd.as_raw_fd()
+        }
+        (x, _) => return x,
+      }
     };
 
     // SAFETY: fchmod on an open descriptor.
@@ -1067,6 +1087,42 @@ impl Server {
     // FATTR_UID and FATTR_GID: the Mac user can't give a file away; chown succeeds and changes
     // nothing, as with Virtualization.framework.
     self.attr_out(id, &mac::fstat(fd).map_err(err)?)
+  }
+
+  /// SETATTR by the node's name in its directory. A symlink's mode has no meaning, a file not
+  /// regular has no size here, and the owner is fixed.
+  fn setattr_at(&self, id: u64, kind: u32, x: &abi::SetattrIn) -> Res {
+    let v = x.valid;
+    let (dir, name) = self.parent_of(id)?;
+    let (at, file) = (dir.as_raw_fd(), name.as_ptr());
+    let mut mode = (v & abi::FATTR_MODE != 0).then_some(x.mode & 0o7777);
+    // With a chown, which changes nothing else.
+    if v & abi::FATTR_KILL_SUIDGID != 0 && kind == S_IFREG {
+      let now = match mode {
+        Some(x) => x,
+        None => self.stat(id)?.mode,
+      };
+
+      mode = Some(killed(now));
+    }
+
+    // SAFETY: a NUL-terminated name in an open directory.
+    if let Some(mode) = mode
+      && kind != S_IFLNK
+      && unsafe { libc::fchmodat(at, file, mode as u16, libc::AT_SYMLINK_NOFOLLOW) } != 0
+    {
+      return Err(os());
+    }
+
+    let ts = times(x);
+    // SAFETY: two timespecs and a NUL-terminated name in an open directory.
+    if v & (abi::FATTR_ATIME | abi::FATTR_MTIME) != 0
+      && unsafe { libc::utimensat(at, file, ts.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0
+    {
+      return Err(os());
+    }
+
+    self.attr_out(id, &self.stat(id)?)
   }
 
   fn rename(&self, from: u64, to: u64, flags: u32, args: &[u8], at: usize) -> Res {
@@ -1389,6 +1445,8 @@ fn mknod(dir: RawFd, name: &CStr, mode: u32) -> Result<(), i32> {
     return Err(os());
   }
 
+  // SAFETY: as for S_IFREG. The mode as the guest asks, as in CREATE.
+  unsafe { libc::fchmodat(dir, name.as_ptr(), perm, libc::AT_SYMLINK_NOFOLLOW) };
   Ok(())
 }
 
@@ -1446,16 +1504,21 @@ fn bind_at(dir: RawFd, name: &CStr, perm: u16) -> Result<(), i32> {
 /// Clears setuid, and setgid on a group-executable file, as Linux does on a write by another.
 fn kill_suidgid(fd: RawFd) {
   let Ok(st) = mac::fstat(fd) else { return };
-  let mut mode = st.mode & 0o7777;
-  mode &= !0o4000;
-  if mode & 0o010 != 0 {
-    mode &= !0o2000;
-  }
-
+  let mode = killed(st.mode);
   if mode != st.mode & 0o7777 {
     // SAFETY: fchmod on an open file.
     unsafe { libc::fchmod(fd, mode as u16) };
   }
+}
+
+/// `mode`'s permissions with setuid cleared, and setgid if group-executable.
+fn killed(mode: u32) -> u32 {
+  let mut mode = mode & 0o7777 & !0o4000;
+  if mode & 0o010 != 0 {
+    mode &= !0o2000;
+  }
+
+  mode
 }
 
 /// The times SETATTR sets: UTIME_OMIT for those it leaves, UTIME_NOW for "now".
@@ -2153,5 +2216,142 @@ mod tests {
     assert_eq!(t.call(abi::MKDIR, d, &cat(&[abi::bytes(&m), &z("e")]), 256).0, -ESTALE);
     assert!(!out.join("d/e").exists());
     let _ = std::fs::remove_dir_all(&out);
+  }
+
+  /// An O_TRUNC open while the node's name is swapped with another file's: only the node's file
+  /// is truncated.
+  #[test]
+  fn opens_truncate_only_their_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut t = T::new("trunc");
+    std::fs::write(t.dir.join("a"), b"a").unwrap();
+    std::fs::write(t.dir.join("b"), b"bbb").unwrap();
+    let a = t.lookup(abi::ROOT_ID, "a").unwrap().nodeid;
+    let b = std::fs::metadata(t.dir.join("b")).unwrap().ino();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swap = {
+      let (stop, dir) = (stop.clone(), t.dir.clone());
+      std::thread::spawn(move || {
+        let (x, y) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+        let d = std::fs::File::open(&dir).unwrap();
+        while !stop.load(Ordering::Relaxed) {
+          // SAFETY: NUL-terminated names in an open directory.
+          unsafe { libc::renameatx_np(d.as_raw_fd(), x.as_ptr(), d.as_raw_fd(), y.as_ptr(), 2) };
+        }
+      })
+    };
+
+    for _ in 0..2000 {
+      if let Ok(fh) = open_fh(&mut t, abi::OPEN, a, 0o1001) {
+        let rl = abi::ReleaseIn { fh, ..Default::default() };
+        t.call(abi::RELEASE, a, abi::bytes(&rl), 0);
+      }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    swap.join().unwrap();
+    let b = ["a", "b"]
+      .map(|x| t.dir.join(x))
+      .into_iter()
+      .find(|x| std::fs::metadata(x).unwrap().ino() == b);
+    assert_eq!(std::fs::read(b.unwrap()).unwrap(), b"bbb");
+  }
+
+  /// A file removed while open, as a temporary file: its attributes still come from it.
+  #[test]
+  fn open_files_outlive_their_names() {
+    let mut t = T::new("unlinked");
+    std::fs::write(t.dir.join("f"), b"12345").unwrap();
+    let f = t.lookup(abi::ROOT_ID, "f").unwrap().nodeid;
+    let fh = open_fh(&mut t, abi::OPEN, f, 2).unwrap();
+    assert_eq!(t.call(abi::UNLINK, abi::ROOT_ID, &z("f"), 0).0, 0);
+    let (e, b) = t.call(abi::GETATTR, f, abi::bytes(&abi::GetattrIn::default()), 256);
+    assert_eq!((e, abi::read::<abi::AttrOut>(&b).unwrap().attr.size), (0, 5));
+
+    // fchmod sends no handle either.
+    let sa = abi::SetattrIn { valid: abi::FATTR_MODE, mode: 0o640, ..Default::default() };
+    let (e, b) = t.call(abi::SETATTR, f, abi::bytes(&sa), 256);
+    assert_eq!((e, abi::read::<abi::AttrOut>(&b).unwrap().attr.mode & 0o7777), (0, 0o640));
+
+    let rl = abi::ReleaseIn { fh, ..Default::default() };
+    t.call(abi::RELEASE, f, abi::bytes(&rl), 0);
+    let (e, _) = t.call(abi::GETATTR, f, abi::bytes(&abi::GetattrIn::default()), 256);
+    assert_eq!(e, -ESTALE);
+  }
+
+  /// The owner changes a mode whatever it is, as the guest's kernel allows; a directory the user
+  /// may only search is looked in.
+  #[test]
+  fn permissions_are_the_owners() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const EACCES: i32 = 13;
+
+    let mut t = T::new("perms");
+    std::fs::create_dir(t.dir.join("d")).unwrap();
+    std::fs::write(t.dir.join("d/f"), b"hi").unwrap();
+    let d = t.lookup(abi::ROOT_ID, "d").unwrap().nodeid;
+    let f = t.lookup(d, "f").unwrap().nodeid;
+    for (node, mode) in [(f, 0o000), (f, 0o200), (f, 0o600), (d, 0o000), (d, 0o111)] {
+      let sa = abi::SetattrIn { valid: abi::FATTR_MODE, mode, ..Default::default() };
+      let (e, b) = t.call(abi::SETATTR, node, abi::bytes(&sa), 256);
+      assert_eq!((e, abi::read::<abi::AttrOut>(&b).unwrap().attr.mode & 0o7777), (0, mode));
+    }
+
+    t.s.dirs.lock().unwrap().retain(|&x, _| x == abi::ROOT_ID);
+    let g = t.lookup(d, "f").unwrap().nodeid;
+    let fh = open_fh(&mut t, abi::OPEN, g, 0).unwrap();
+    let rd = abi::ReadIn { fh, offset: 0, size: 16, ..Default::default() };
+    assert_eq!(t.call(abi::READ, g, abi::bytes(&rd), 16), (0, b"hi".to_vec()));
+    assert_eq!(open_fh(&mut t, abi::OPENDIR, d, 0), Err(EACCES));
+    std::fs::set_permissions(t.dir.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+  }
+
+  /// What the guest makes has the mode it asks, its umask applied: not the Mac's umask too.
+  #[test]
+  fn modes_are_the_guests() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut t = T::new("umask");
+    let c = abi::CreateIn { flags: 0o102, mode: 0o100666, ..Default::default() }; // O_CREAT|O_RDWR
+    assert_eq!(t.call(abi::CREATE, abi::ROOT_ID, &cat(&[abi::bytes(&c), &z("f")]), 256).0, 0);
+    let m = abi::MkdirIn { mode: 0o777, umask: 0 };
+    assert_eq!(t.call(abi::MKDIR, abi::ROOT_ID, &cat(&[abi::bytes(&m), &z("d")]), 256).0, 0);
+    let n = abi::MknodIn { mode: 0o010666, ..Default::default() };
+    assert_eq!(t.call(abi::MKNOD, abi::ROOT_ID, &cat(&[abi::bytes(&n), &z("p")]), 256).0, 0);
+    for (x, mode) in [("f", 0o666), ("d", 0o777), ("p", 0o666)] {
+      assert_eq!(std::fs::symlink_metadata(t.dir.join(x)).unwrap().mode() & 0o7777, mode, "{x}");
+    }
+
+    // A file already there keeps its mode.
+    let c = abi::CreateIn { flags: 2, mode: 0o100600, ..Default::default() };
+    assert_eq!(t.call(abi::CREATE, abi::ROOT_ID, &cat(&[abi::bytes(&c), &z("f")]), 256).0, 0);
+    assert_eq!(std::fs::metadata(t.dir.join("f")).unwrap().mode() & 0o7777, 0o666);
+  }
+
+  /// A hard link made on the Mac is a new name; a directory made or removed is told as one.
+  #[test]
+  fn notifications_name_links_and_directories() {
+    let mut t = T::new("names");
+    std::fs::write(t.dir.join("f"), b"").unwrap();
+    t.lookup(abi::ROOT_ID, "f").unwrap();
+    let root = t.dir.canonicalize().unwrap();
+    let path = |name: &str| root.join(name).as_os_str().as_bytes().to_vec();
+    let entries = |n: &[Vec<u8>]| {
+      let x = n
+        .iter()
+        .filter(|x| abi::read::<abi::OutHeader>(x).unwrap().error == abi::NOTIFY_INVAL_ENTRY);
+      x.map(|x| abi::read::<abi::NotifyInvalEntryOut>(&x[16..]).unwrap().flags).collect::<Vec<_>>()
+    };
+
+    std::fs::hard_link(t.dir.join("f"), t.dir.join("g")).unwrap();
+    assert_eq!(entries(&t.s.changed(&path("g"), 0x100)), [0]);
+    std::fs::create_dir(t.dir.join("d")).unwrap();
+    assert_eq!(entries(&t.s.changed(&path("d"), 0x100 | 0x20000)), [abi::INVAL_DIR]);
+    std::fs::remove_dir(t.dir.join("d")).unwrap();
+    let n = t.s.changed(&path("d"), 0x200 | 0x20000);
+    assert_eq!(abi::read::<abi::NotifyDeleteOut>(&n[0][16..]).unwrap().padding, abi::INVAL_DIR);
   }
 }

@@ -564,6 +564,9 @@ pub struct NotifyInvalEntryOut {
 /// lodka's, in `NotifyInvalEntryOut.flags`: the contents of a file the guest has no inode for
 /// changed, which only inotify hears of.
 pub const INVAL_MODIFIED: u32 = 1 << 31;
+/// lodka's, in `NotifyInvalEntryOut.flags` or `NotifyDeleteOut.padding`: the name is a
+/// directory's, for inotify's IN_ISDIR.
+pub const INVAL_DIR: u32 = 1 << 30;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

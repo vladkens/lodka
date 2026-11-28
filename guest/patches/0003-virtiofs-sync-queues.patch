@@ -9,7 +9,7 @@ does a request the device answers VIRTIO_FS_SYNC_AGAIN, one on a file it would h
 download first.
 Prior art: libkrun's VIRTIO_FS_F_SYNC, with an MMIO notify in place of the HVC.
 diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
-index 5a56356..3ca795a 100644
+index cd527f6..6d5419c 100644
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
 @@ -5,11 +5,14 @@
@@ -51,7 +51,7 @@ index 5a56356..3ca795a 100644
  	struct dax_device *dax_dev;
  
  	unsigned int *mq_map; /* index = cpu id, value = request vq id */
-@@ -1243,6 +1256,21 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1240,6 +1253,21 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	}
  	desc.pre_vectors = fs->req_vq;
  	fs->nvqs = fs->req_vq + fs->num_request_queues;
@@ -73,7 +73,7 @@ index 5a56356..3ca795a 100644
  	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
  	if (!fs->vqs)
  		return -ENOMEM;
-@@ -1269,7 +1297,7 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1266,7 +1294,7 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	}
  
  	/* Initialize the requests virtqueues */
@@ -82,7 +82,7 @@ index 5a56356..3ca795a 100644
  		char vq_name[VQ_NAME_LEN];
  
  		snprintf(vq_name, VQ_NAME_LEN, "requests.%u", i - fs->req_vq);
-@@ -1278,6 +1306,15 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1275,6 +1303,15 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  		vqs_info[i].name = fs->vqs[i].name;
  	}
  
@@ -98,7 +98,7 @@ index 5a56356..3ca795a 100644
  	ret = virtio_find_vqs(vdev, fs->nvqs, vqs, vqs_info, &desc);
  	if (ret < 0)
  		goto out;
-@@ -1525,7 +1562,7 @@ static const struct virtio_device_id id_table[] = {
+@@ -1522,7 +1559,7 @@ static const struct virtio_device_id id_table[] = {
  	{},
  };
  
@@ -107,7 +107,7 @@ index 5a56356..3ca795a 100644
  
  static struct virtio_driver virtio_fs_driver = {
  	.driver.name		= KBUILD_MODNAME,
-@@ -1781,6 +1818,101 @@ out:
+@@ -1778,6 +1815,101 @@ out:
  	return ret;
  }
  
@@ -209,7 +209,7 @@ index 5a56356..3ca795a 100644
  static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
  {
  	unsigned int queue_id;
-@@ -1793,6 +1925,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+@@ -1790,6 +1922,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
  	clear_bit(FR_PENDING, &req->flags);
  
  	fs = fiq->priv;
@@ -220,7 +220,7 @@ index 5a56356..3ca795a 100644
  
  	pr_debug("%s: opcode %u unique %#llx nodeid %#llx in.len %u out.len %u queue_id %u\n",
 diff --git a/include/uapi/linux/virtio_fs.h b/include/uapi/linux/virtio_fs.h
-index 3156fd0..933d5c0 100644
+index 3db0e7e..31efb35 100644
 --- a/include/uapi/linux/virtio_fs.h
 +++ b/include/uapi/linux/virtio_fs.h
 @@ -17,10 +17,23 @@ struct virtio_fs_config {
