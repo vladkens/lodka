@@ -10,6 +10,6 @@ The maintainer's backlog, in order: each item is done as a plan in `docs/plans/`
 - [ ] **x86_64 images through Rosetta.** The Rosetta runtime shared into the guest and registered with binfmt_misc.
 - [ ] **Memory back to the Mac.** Free page reporting (virtio-balloon), so an idle VM gives back what it no longer uses. Plan: [20261127-memory.md](plans/completed/20261127-memory.md).
 - [ ] **A Docker context.** `lodka start` adds a `lodka` context and `lodka stop` leaves it, so `docker context use lodka` works without `DOCKER_HOST`. Plan: [20261127-context.md](plans/completed/20261127-context.md).
-- [ ] **Releases.** A tarball with the binary, `Image` and `rootfs.img`, and a Homebrew formula.
+- [ ] **Releases.** A tarball with the binary, `Image` and `rootfs.img`, and a Homebrew formula. Plan: [20261127-releases.md](plans/completed/20261127-releases.md).
 
 Not planned: x86 Macs, Intel guests emulated, Kubernetes, a GUI.
