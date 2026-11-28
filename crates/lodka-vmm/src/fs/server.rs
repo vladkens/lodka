@@ -70,6 +70,8 @@ pub struct Server {
   next_fh: AtomicU64,
   /// Descriptors of directories the guest works in, by node.
   dirs: Mutex<HashMap<u64, Arc<OwnedFd>>>,
+  /// How many times they were dropped, counted with `dirs` held.
+  dropped: AtomicU64,
   /// FSEvents tells the guest what changes on the Mac.
   watched: AtomicBool,
   /// The changes FSEvents saw so far: what was listed before the last is no longer news.
@@ -190,6 +192,7 @@ impl Server {
       max_handles: (rl.rlim_cur / 2) as usize,
       next_fh: AtomicU64::new(1),
       dirs: Mutex::new(HashMap::from([(abi::ROOT_ID, Arc::new(fd))])),
+      dropped: AtomicU64::new(0),
       watched: AtomicBool::new(false),
       changes: AtomicU64::new(0),
     })
@@ -769,14 +772,21 @@ impl Server {
 
   /// No descriptor is kept but the share's own: each directory is opened again by its path.
   fn drop_dirs(&self) {
-    self.dirs.lock().unwrap().retain(|&x, _| x == abi::ROOT_ID);
+    let mut dirs = self.dirs.lock().unwrap();
+    dirs.retain(|&x, _| x == abi::ROOT_ID);
+    self.dropped.fetch_add(1, Ordering::Relaxed);
   }
 
   /// A directory node's descriptor, kept for the next lookup in it.
   fn dir(&self, id: u64) -> Result<Arc<OwnedFd>, i32> {
-    if let Some(x) = self.dirs.lock().unwrap().get(&id) {
-      return Ok(x.clone());
-    }
+    let dropped = {
+      let dirs = self.dirs.lock().unwrap();
+      if let Some(x) = dirs.get(&id) {
+        return Ok(x.clone());
+      }
+
+      self.dropped.load(Ordering::Relaxed)
+    };
 
     // One the user may search but not read is opened for that alone, and not kept: macOS checks
     // a search-only descriptor's permission once, at its open, and a chmod since would not count.
@@ -791,7 +801,12 @@ impl Server {
       return Ok(fd);
     }
 
+    // Nor if they were dropped while it opened: it may be from before a move or a chmod.
     let mut dirs = self.dirs.lock().unwrap();
+    if self.dropped.load(Ordering::Relaxed) != dropped {
+      return Ok(fd);
+    }
+
     if dirs.len() >= DIRS {
       dirs.retain(|&x, _| x == abi::ROOT_ID);
     }
