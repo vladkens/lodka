@@ -46,6 +46,7 @@ const MEMORY_RWX: u64 = 0b111;
 unsafe extern "C" {
   fn hv_vm_create(config: *mut c_void) -> i32;
   fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> i32;
+  fn hv_vm_unmap(ipa: u64, size: usize) -> i32;
   fn hv_vcpu_create(vcpu: *mut Vcpu, exit: *mut *const Exit, config: *mut c_void) -> i32;
   fn hv_vcpu_destroy(vcpu: Vcpu) -> i32;
   fn hv_vcpu_run(vcpu: Vcpu) -> i32;
@@ -118,6 +119,15 @@ pub fn vm_create() -> io::Result<()> {
 pub unsafe fn vm_map(host: *mut u8, ipa: u64, size: usize) -> io::Result<()> {
   // SAFETY: the caller keeps `host` mapped for `size` bytes while the VM lives.
   check(unsafe { hv_vm_map(host.cast(), ipa, size, MEMORY_RWX) }, "hv_vm_map")
+}
+
+/// Takes `size` bytes at `ipa` out of the guest's address space, as mapped by `vm_map`.
+///
+/// # Safety
+/// No vCPU may touch the range until it is mapped again.
+pub unsafe fn vm_unmap(ipa: u64, size: usize) -> io::Result<()> {
+  // SAFETY: the caller keeps the guest off the range.
+  check(unsafe { hv_vm_unmap(ipa, size) }, "hv_vm_unmap")
 }
 
 // MARK: GIC

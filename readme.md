@@ -10,6 +10,7 @@ fast as OrbStack: its own VMM on Hypervisor.framework, no QEMU, no Virtualizatio
   sparse disk that gives freed space back to the Mac.
 - Containers' ports on `localhost`; the VM's own address (new each start) reachable too.
 - The Mac's `/Users` in the VM at the same path: `docker run -v "$PWD:/app"` just works.
+- Memory the VM no longer uses goes back to the Mac, its idle file cache too.
 - `lodka ssh` into the VM as root, with a key lodka makes.
 
 Requires a Mac with Apple silicon on macOS 26 or later.
@@ -42,10 +43,13 @@ lodka delete                       # the disk, with all images, containers and v
 ## How it works
 
 - The VMM: Hypervisor.framework's vCPUs and its in-kernel GICv3; virtio over MMIO for the console,
-  entropy, the two disks, the network, vsock and the Mac's folders; PSCI for the vCPUs and power;
-  the Linux `Image` booted directly with a device tree, no firmware.
+  entropy, the two disks, the network, vsock, the Mac's folders and the balloon; PSCI for the vCPUs
+  and power; the Linux `Image` booted directly with a device tree, no firmware.
 - The Mac's folders: virtio-fs, served from macOS files on the vCPU's own thread. Edits on the Mac
   reach the guest's caches and inotify in containers.
+- Memory: guest RAM in 2 MiB pieces, then 64 KiB once given back; the guest reports the memory it
+  frees (free page reporting), and the VMM gives whole pieces back to macOS at once. Idle, the
+  guest trims its page cache.
 - The network: a vmnet shared network, so macOS does NAT, DHCP and DNS. Packets go between vmnet
   and guest memory with no copy.
 - Docker's socket and containers' ports on the Mac: each connection goes over vsock into the

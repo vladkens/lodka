@@ -152,8 +152,7 @@ impl Machine {
   pub fn new(cfg: Config) -> io::Result<Machine> {
     hv::vm_create()?;
     let mem = Arc::new(Mem::new(RAM_BASE, cfg.memory)?);
-    // SAFETY: the mapping lives in `mem`, which the machine keeps until the process exits.
-    unsafe { hv::vm_map(mem.host(), RAM_BASE, cfg.memory as usize)? };
+    mem.map_into_vm()?;
     let gic = hv::gic_create(GIC_BASE, cfg.cpus)?;
     if gic.end > RAM_BASE {
       return Err(io::Error::other(format!("the GIC's space ends at {:#x}, in RAM", gic.end)));
@@ -475,6 +474,15 @@ impl Machine {
           let rt = (syndrome >> 5 & 0x1f) as u32;
           if syndrome & 1 == 1 && rt != 31 {
             cpu.set_reg(hv::REG_X0 + rt, 0);
+          }
+        }
+
+        // A data abort in RAM: the access raced a piece given back to the Mac between its unmap
+        // and map (`Mem::give_back`), and goes again; unless a piece never went back.
+        0x24 if self.mem.contains(exit.exception.physical_address) => {
+          if self.mem.lost() {
+            let addr = exit.exception.physical_address;
+            return Err(io::Error::other(format!("guest RAM at {addr:#x} lost: hv_vm_map failed")));
           }
         }
 

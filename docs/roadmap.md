@@ -8,7 +8,7 @@ The maintainer's backlog, in order: each item is done as a plan in `docs/plans/`
 - [ ] **The commands.** `lodka start|stop|status|ssh|delete`: the VM in a process of its own under a lock, its settings, sshd with lodka's key, containers' ports on localhost, a reboot in place. Plan: [20261126-commands.md](plans/completed/20261126-commands.md).
 - [ ] **The Mac's folders in the guest, fast.** `/Users` at the same path: FUSE requests from the guest kernel served by lodka from macOS files (inodes by dev/ino and `fsgetpath`, `getattrlistbulk`, `clonefile`), long entry and attribute timeouts with FSEvents invalidating what changed, requests on the vCPU's thread through a hypercall instead of a virtqueue round trip. Measured against OrbStack and virtiofs on the same Mac. Plan: [20261127-folders.md](plans/completed/20261127-folders.md).
 - [ ] **x86_64 images through Rosetta.** The Rosetta runtime shared into the guest and registered with binfmt_misc.
-- [ ] **Memory back to the Mac.** Free page reporting (virtio-balloon), so an idle VM gives back what it no longer uses.
+- [ ] **Memory back to the Mac.** Free page reporting (virtio-balloon), so an idle VM gives back what it no longer uses. Plan: [20261127-memory.md](plans/completed/20261127-memory.md).
 - [ ] **A Docker context.** `lodka start` adds a `lodka` context and `lodka stop` leaves it, so `docker context use lodka` works without `DOCKER_HOST`.
 - [ ] **Releases.** A tarball with the binary, `Image` and `rootfs.img`, and a Homebrew formula.
 

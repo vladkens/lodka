@@ -1,10 +1,12 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/lodka
 //! PID 1 of lodka's VM: mounts the file systems (a read-only erofs root, the data disk at
 //! /var/lib), starts the network, sshd and dockerd and keeps them running, reaps orphans, and
-//! talks to lodka on the Mac over vsock. Powers the VM off when lodka asks.
+//! talks to lodka on the Mac over vsock. Trims its page cache when idle, and powers the VM off
+//! when lodka asks.
 
 mod agent;
 mod sys;
+mod trim;
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -50,6 +52,7 @@ fn main() {
   }
 
   agent::start();
+  trim::start();
   reap();
 }
 
@@ -222,6 +225,9 @@ const SYSCTLS: &[(&str, &str)] = &[
   // TCP lowers its segment size once it sees them lost.
   ("net.ipv4.tcp_mtu_probing", "1"),
   ("vm.max_map_count", "1048576"),
+  // Compaction moves pages into memory given back to the Mac, which takes it again; it runs
+  // once after a trim instead (trim.rs).
+  ("vm.compaction_proactiveness", "0"),
   ("kernel.panic", "-1"),
 ];
 
