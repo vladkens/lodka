@@ -1051,6 +1051,7 @@ impl Server {
       Err(_) => true,
     };
 
+    let changes = self.mac_changes.load(Ordering::SeqCst);
     let flags = mac::open_flags(x.flags) | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // A FIFO already there opens at once, as in `open_node`; ESTALE has the guest look it up.
     let fl = flags | libc::O_NONBLOCK;
@@ -1072,8 +1073,13 @@ impl Server {
     let st = mac::fstat(fd.as_raw_fd()).map_err(err)?;
     let fd = plain(fd, &st, flags)?;
     let pdev = self.node(r.h.nodeid)?.dev;
-    let entry = self.entry(&st, pdev)?;
+    let mut entry = self.entry(&st, pdev)?;
     self.told(entry.nodeid);
+    // As in `entry_at`.
+    if self.mac_changes.load(Ordering::SeqCst) != changes {
+      (entry.attr_valid, entry.attr_valid_nsec) = (0, 0);
+    }
+
     let open_flags = self.opened(entry.nodeid, fd.as_raw_fd(), x.flags)?;
     let fh = self.add_handle(entry.nodeid, fd).inspect_err(|_| self.forget(entry.nodeid, 1))?;
     let open = abi::OpenOut { fh, open_flags, ..Default::default() };
