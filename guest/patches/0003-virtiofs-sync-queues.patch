@@ -9,10 +9,10 @@ does a request the device answers VIRTIO_FS_SYNC_AGAIN, one on a file it would h
 download first.
 Prior art: libkrun's VIRTIO_FS_F_SYNC, with an MMIO notify in place of the HVC.
 diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
-index cd527f6..6d5419c 100644
+index 3582fa7..4e00217 100644
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
-@@ -5,11 +5,14 @@
+@@ -5,6 +5,7 @@
   */
  
  #include <linux/fs.h>
@@ -20,14 +20,16 @@ index cd527f6..6d5419c 100644
  #include <linux/dax.h>
  #include <linux/fsnotify.h>
  #include <linux/iversion.h>
- #include <linux/namei.h>
+@@ -12,6 +13,8 @@
+ #include <linux/pagemap.h>
+ #include <linux/posix_acl.h>
  #include <linux/pci.h>
 +#include <linux/platform_device.h>
 +#include <linux/sizes.h>
  #include <linux/interrupt.h>
  #include <linux/group_cpus.h>
  #include <linux/memremap.h>
-@@ -31,6 +34,13 @@
+@@ -33,6 +36,13 @@
   */
  #define FUSE_HEADER_OVERHEAD    4
  
@@ -41,7 +43,7 @@ index cd527f6..6d5419c 100644
  /* List of virtio-fs device instances and a lock for the list. Also provides
   * mutual exclusion in device removal and mounting path
   */
-@@ -77,6 +87,9 @@ struct virtio_fs {
+@@ -79,6 +89,9 @@ struct virtio_fs {
  	unsigned int notify_vq;          /* the notification queue, 0 for none */
  	unsigned int notify_buf_size;
  	void *notify_bufs;
@@ -51,7 +53,7 @@ index cd527f6..6d5419c 100644
  	struct dax_device *dax_dev;
  
  	unsigned int *mq_map; /* index = cpu id, value = request vq id */
-@@ -1240,6 +1253,21 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1292,6 +1305,21 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	}
  	desc.pre_vectors = fs->req_vq;
  	fs->nvqs = fs->req_vq + fs->num_request_queues;
@@ -73,7 +75,7 @@ index cd527f6..6d5419c 100644
  	fs->vqs = kcalloc(fs->nvqs, sizeof(fs->vqs[VQ_HIPRIO]), GFP_KERNEL);
  	if (!fs->vqs)
  		return -ENOMEM;
-@@ -1266,7 +1294,7 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1318,7 +1346,7 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  	}
  
  	/* Initialize the requests virtqueues */
@@ -82,7 +84,7 @@ index cd527f6..6d5419c 100644
  		char vq_name[VQ_NAME_LEN];
  
  		snprintf(vq_name, VQ_NAME_LEN, "requests.%u", i - fs->req_vq);
-@@ -1275,6 +1303,15 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
+@@ -1327,6 +1355,15 @@ static int virtio_fs_setup_vqs(struct virtio_device *vdev,
  		vqs_info[i].name = fs->vqs[i].name;
  	}
  
@@ -98,7 +100,7 @@ index cd527f6..6d5419c 100644
  	ret = virtio_find_vqs(vdev, fs->nvqs, vqs, vqs_info, &desc);
  	if (ret < 0)
  		goto out;
-@@ -1522,7 +1559,7 @@ static const struct virtio_device_id id_table[] = {
+@@ -1574,7 +1611,7 @@ static const struct virtio_device_id id_table[] = {
  	{},
  };
  
@@ -107,7 +109,7 @@ index cd527f6..6d5419c 100644
  
  static struct virtio_driver virtio_fs_driver = {
  	.driver.name		= KBUILD_MODNAME,
-@@ -1778,6 +1815,101 @@ out:
+@@ -1830,6 +1867,101 @@ out:
  	return ret;
  }
  
@@ -209,7 +211,7 @@ index cd527f6..6d5419c 100644
  static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
  {
  	unsigned int queue_id;
-@@ -1790,6 +1922,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+@@ -1842,6 +1974,9 @@ static void virtio_fs_send_req(struct fuse_iqueue *fiq, struct fuse_req *req)
  	clear_bit(FR_PENDING, &req->flags);
  
  	fs = fiq->priv;

@@ -4,7 +4,7 @@
 //! reached again through its path from `fsgetpath` and checked to be the same file; only open
 //! files and directories hold descriptors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -24,6 +24,7 @@ const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 const ENOMEM: i32 = 12;
+const EACCES: i32 = 13;
 const EEXIST: i32 = 17;
 const E2BIG: i32 = 7;
 const EINVAL: i32 = 22;
@@ -54,6 +55,9 @@ const DIRS: usize = 256;
 /// Nodes the guest may hold at once, some 150 bytes each: a guest kernel keeps far fewer inodes,
 /// one that never forgets gets ENOMEM.
 const NODES: usize = 4 << 20;
+/// Files made on the Mac that the guest heard of before it had nodes for them, kept for when it
+/// does: past this many, forgotten.
+const TOLD: usize = 16 << 10;
 
 pub struct Server {
   root: CString,
@@ -80,12 +84,16 @@ struct Node {
   /// The file's mtime and size as the guest was last told them. Unchanged at an open, its
   /// attributes and pages in the guest are good: the guest drops pages when either changes.
   seen: Option<((i64, u32), u64)>,
+  /// The guest knows the name was made: it made the file, or was told that FSEvents saw it made.
+  told: bool,
 }
 
 struct Nodes {
   ids: HashMap<u64, Node>,
   keys: HashMap<(i32, u64), u64>,
   next: u64,
+  /// Files without a node the guest was told were made, by `(dev, ino)`: at most TOLD.
+  told: HashSet<(i32, u64)>,
 }
 
 struct Handle {
@@ -151,13 +159,14 @@ impl Server {
     let root = CString::new(root.canonicalize()?.into_os_string().into_vec())?;
     // `open` gives Linux's errno, for the guest; errno is still macOS's.
     let fd =
-      open(&root, libc::O_SEARCH | libc::O_DIRECTORY).map_err(|_| io::Error::last_os_error())?;
+      open(&root, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|_| io::Error::last_os_error())?;
     let st = mac::fstat(fd.as_raw_fd())?;
-    let node = Node { dev: st.dev, ino: st.ino, kind: S_IFDIR, refs: 1, seen: None };
+    let node = Node { dev: st.dev, ino: st.ino, kind: S_IFDIR, refs: 1, seen: None, told: true };
     let nodes = Nodes {
       ids: HashMap::from([(abi::ROOT_ID, node)]),
       keys: HashMap::from([((st.dev, st.ino), abi::ROOT_ID)]),
       next: abi::ROOT_ID + 1,
+      told: HashSet::new(),
     };
 
     // SAFETY: a plain C struct, valid zeroed.
@@ -246,9 +255,11 @@ impl Server {
       out.push(note(abi::NOTIFY_INVAL_ENTRY, &[abi::bytes(&x), name, &[0]]));
     };
 
-    // FSEvents keeps a file's Created flag on its later events: a name for a node the guest
-    // has is not new, unless it was moved or is a hard link's.
-    if flags & MOVED != 0 || (flags & CREATED != 0 && (known.is_none() || st.nlink > 1)) {
+    // FSEvents keeps a file's Created flag on its later events: a name is news once, as the
+    // guest may have looked it up first, unless it was moved or is a hard link's.
+    if flags & MOVED != 0
+      || (flags & CREATED != 0 && (self.untold(&st) || (!st.is_dir() && st.nlink > 1)))
+    {
       entry(is_dir);
     }
 
@@ -382,14 +393,14 @@ impl Server {
           return Err(os());
         }
 
-        self.entry_at(id, &dir, name)
+        self.entry_at(id, &dir, name, true)
       }
       abi::MKNOD => {
         let x: abi::MknodIn = arg(r.args, 0)?;
         let (name, _) = name(r.args, size_of::<abi::MknodIn>())?;
         let dir = self.dir(id)?;
         mknod(dir.as_raw_fd(), name, x.mode)?;
-        self.entry_at(id, &dir, name)
+        self.entry_at(id, &dir, name, true)
       }
       abi::MKDIR => {
         let x: abi::MkdirIn = arg(r.args, 0)?;
@@ -403,7 +414,7 @@ impl Server {
 
         // SAFETY: as for mkdirat. The mode as the guest asks, as in CREATE.
         unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) };
-        self.entry_at(id, &dir, name)
+        self.entry_at(id, &dir, name, true)
       }
       abi::UNLINK | abi::RMDIR => {
         let (name, _) = name(r.args, 0)?;
@@ -437,7 +448,7 @@ impl Server {
           return Err(os());
         }
 
-        self.entry_at(id, &dir, name)
+        self.entry_at(id, &dir, name, true)
       }
       abi::OPEN => {
         let x: abi::OpenIn = arg(r.args, 0)?;
@@ -471,7 +482,15 @@ impl Server {
       // Writes reach the file at once, so a close has nothing to flush: ENOSYS, and the guest
       // sends no more FLUSHes.
       abi::FLUSH => Err(ENOSYS),
-      abi::SYNCFS => Ok(Out::Bytes(Vec::new())),
+      abi::SYNCFS => {
+        let dir = self.dir(id)?;
+        // SAFETY: an open directory on the volume; the flag waits for the writes to end.
+        if unsafe { fsync_volume_np(dir.as_raw_fd(), SYNC_VOLUME_WAIT) } != 0 {
+          return Err(os());
+        }
+
+        Ok(Out::Bytes(Vec::new()))
+      }
       abi::RELEASE | abi::RELEASEDIR => {
         let x: abi::ReleaseIn = arg(r.args, 0)?;
         self.handles.lock().unwrap().remove(&x.fh);
@@ -536,13 +555,16 @@ impl Server {
           return Err(EPERM);
         }
 
-        self.in_dir(id, |file| {
+        let done = |r: i32| if r == 0 { Ok(Out::Bytes(Vec::new())) } else { Err(os()) };
+        self.on_file(
+          id,
           // SAFETY: NUL-terminated strings.
-          match unsafe { libc::removexattr(file.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) } {
-            0 => Ok(Out::Bytes(Vec::new())),
-            _ => Err(os()),
-          }
-        })
+          |fd| done(unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) }),
+          // SAFETY: as for a descriptor.
+          |file| {
+            done(unsafe { libc::removexattr(file.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) })
+          },
+        )
       }
       abi::COPY_FILE_RANGE | abi::COPY_FILE_RANGE_64 => {
         let x: abi::CopyFileRangeIn = arg(r.args, 0)?;
@@ -647,7 +669,8 @@ impl Server {
     let id = n.next;
     n.next += 1;
     let seen = Some((st.mtime, st.size));
-    let node = Node { dev: st.dev, ino: st.ino, kind: st.kind(), refs: 1, seen };
+    let told = n.told.remove(&(st.dev, st.ino));
+    let node = Node { dev: st.dev, ino: st.ino, kind: st.kind(), refs: 1, seen, told };
     n.ids.insert(id, node);
     n.keys.insert((st.dev, st.ino), id);
     Ok(id)
@@ -722,8 +745,13 @@ impl Server {
       return Ok(x.clone());
     }
 
-    // For lookups only: a directory the user may search but not read works too.
-    let fd = Arc::new(self.open_node(id, libc::O_SEARCH | libc::O_DIRECTORY)?);
+    // One the user may search but not read is opened for that alone, and not kept: macOS checks
+    // a search-only descriptor's permission once, at its open, and a chmod since would not count.
+    let fd = match self.open_node(id, libc::O_RDONLY | libc::O_DIRECTORY) {
+      Err(EACCES) => return Ok(Arc::new(self.open_node(id, libc::O_SEARCH | libc::O_DIRECTORY)?)),
+      x => Arc::new(x?),
+    };
+
     let mut dirs = self.dirs.lock().unwrap();
     if dirs.len() >= DIRS {
       dirs.retain(|&x, _| x == abi::ROOT_ID);
@@ -763,6 +791,25 @@ impl Server {
     r
   }
 
+  /// `fd` on a descriptor of the node's file, as a name may lead to another file by the time it
+  /// is used: the guest's open file, or one opened for this alone. `name` on its name in its
+  /// directory where none opens (`open_any`).
+  fn on_file<T>(
+    &self,
+    id: u64,
+    fd: impl FnOnce(RawFd) -> Result<T, i32>,
+    name: impl FnOnce(&CStr) -> Result<T, i32>,
+  ) -> Result<T, i32> {
+    if let Some(h) = self.handle_of(id) {
+      return fd(h.fd.as_raw_fd());
+    }
+
+    match self.open_any(id, self.node(id)?.kind)? {
+      Some(x) => fd(x.as_raw_fd()),
+      None => self.in_dir(id, name),
+    }
+  }
+
   /// The node's attributes now: by its path, or, with none left, by a file the guest has open
   /// for it, as one removed while open.
   fn stat(&self, id: u64) -> Result<Stat, i32> {
@@ -783,7 +830,7 @@ impl Server {
 
   fn lookup(&self, parent: u64, name: &CStr) -> Res {
     let dir = self.dir(parent)?;
-    match self.entry_at(parent, &dir, name) {
+    match self.entry_at(parent, &dir, name, false) {
       // No such name, cached as long as a name: FSEvents tells the guest when it appears.
       Err(ENOENT) if self.watched.load(Ordering::Relaxed) => reply(&abi::EntryOut {
         entry_valid: self.ttl().as_secs(),
@@ -794,8 +841,9 @@ impl Server {
     }
   }
 
-  /// The entry for `name` in the directory node `parent`, open as `dir`; a lookup for the guest.
-  fn entry_at(&self, parent: u64, dir: &OwnedFd, name: &CStr) -> Res {
+  /// The entry for `name` in the directory node `parent`, open as `dir`; a lookup for the guest,
+  /// or the reply to its making the file (`made`).
+  fn entry_at(&self, parent: u64, dir: &OwnedFd, name: &CStr, made: bool) -> Res {
     let (stored, st) = mac::stat_at(dir.as_raw_fd(), name).map_err(err)?;
     // Byte for byte: on a case- or normalization-insensitive volume another spelling finds the
     // file too, and the guest would see one inode under two names.
@@ -804,7 +852,12 @@ impl Server {
     }
 
     let pdev = self.node(parent)?.dev;
-    reply(&self.entry(&st, pdev)?)
+    let e = self.entry(&st, pdev)?;
+    if made {
+      self.told(e.nodeid);
+    }
+
+    reply(&e)
   }
 
   fn entry(&self, st: &Stat, parent_dev: i32) -> Result<abi::EntryOut, i32> {
@@ -841,6 +894,30 @@ impl Server {
   /// The node of a file the guest knows.
   fn known(&self, st: &Stat) -> Option<u64> {
     self.nodes.lock().unwrap().keys.get(&(st.dev, st.ino)).copied()
+  }
+
+  /// The guest made the node's file: it knows the name was made.
+  fn told(&self, id: u64) {
+    if let Some(x) = self.nodes.lock().unwrap().ids.get_mut(&id) {
+      x.told = true;
+    }
+  }
+
+  /// Whether the guest is yet to hear that `st`'s name was made, which it then has. Told again
+  /// while it has no node, as before.
+  fn untold(&self, st: &Stat) -> bool {
+    let mut n = self.nodes.lock().unwrap();
+    let key = (st.dev, st.ino);
+    if let Some(&id) = n.keys.get(&key) {
+      return n.ids.get_mut(&id).is_none_or(|x| !std::mem::replace(&mut x.told, true));
+    }
+
+    if n.told.len() >= TOLD {
+      n.told.clear();
+    }
+
+    n.told.insert(key);
+    true
   }
 
   // MARK: Files
@@ -927,6 +1004,7 @@ impl Server {
     let fd = plain(fd, &st, flags)?;
     let pdev = self.node(r.h.nodeid)?.dev;
     let entry = self.entry(&st, pdev)?;
+    self.told(entry.nodeid);
     let open_flags = self.opened(entry.nodeid, fd.as_raw_fd(), x.flags)?;
     let fh = self.add_handle(entry.nodeid, fd).inspect_err(|_| self.forget(entry.nodeid, 1))?;
     let open = abi::OpenOut { fh, open_flags, ..Default::default() };
@@ -971,7 +1049,7 @@ impl Server {
     }
 
     let at = size_of::<abi::InHeader>() + size_of::<abi::WriteIn>();
-    let len = (x.size as usize).min(r.chain.read_len().saturating_sub(at));
+    let len = (x.size.min(MAX_IO) as usize).min(r.chain.read_len().saturating_sub(at));
     let mut done = 0;
     while done < len {
       let iov = r.chain.iovecs(r.mem, false, at + done, len - done).map_err(err)?;
@@ -1042,9 +1120,9 @@ impl Server {
     let id = r.h.nodeid;
     let node = self.node(id)?;
     let v = x.valid;
-    // The guest's open file, or one opened to truncate, as that needs write permission anyway.
-    // Else by the name: a mode or times need no permission to open the file, and a FIFO's open
-    // waits; by an open file of the guest's only once the name is gone.
+    // By a descriptor, as a name may lead to another file by the time it is used: the guest's
+    // open file, one opened to truncate, which needs write permission anyway, or one opened for
+    // this alone. By the name only where none opens.
     let (handle, file);
     let fd = if v & abi::FATTR_FH != 0 {
       handle = self.handle_fd(x.fh)?;
@@ -1053,14 +1131,14 @@ impl Server {
       // No I/O through it: it may stay non-blocking.
       file = self.open_node(id, libc::O_WRONLY | libc::O_NONBLOCK)?;
       file.as_raw_fd()
+    } else if let Some(h) = self.handle_of(id) {
+      handle = h;
+      handle.fd.as_raw_fd()
+    } else if let Some(x) = self.open_any(id, node.kind)? {
+      file = x;
+      file.as_raw_fd()
     } else {
-      match (self.setattr_at(id, node.kind, &x), self.handle_of(id)) {
-        (Err(ESTALE), Some(h)) => {
-          handle = h;
-          handle.fd.as_raw_fd()
-        }
-        (x, _) => return x,
-      }
+      return self.setattr_at(id, node.kind, &x);
     };
 
     // SAFETY: fchmod on an open descriptor.
@@ -1087,6 +1165,26 @@ impl Server {
     // FATTR_UID and FATTR_GID: the Mac user can't give a file away; chown succeeds and changes
     // nothing, as with Virtualization.framework.
     self.attr_out(id, &mac::fstat(fd).map_err(err)?)
+  }
+
+  /// The node's file opened with what access the user has, for its attributes alone; none for a
+  /// file the user may neither read nor write, a symlink, a FIFO, whose open waits for the other
+  /// end, or a socket.
+  fn open_any(&self, id: u64, kind: u32) -> Result<Option<OwnedFd>, i32> {
+    let tries: &[i32] = match kind {
+      S_IFREG => &[libc::O_RDONLY | libc::O_NONBLOCK, libc::O_WRONLY | libc::O_NONBLOCK],
+      S_IFDIR => &[libc::O_RDONLY | libc::O_DIRECTORY, libc::O_SEARCH | libc::O_DIRECTORY],
+      _ => &[],
+    };
+
+    for &flags in tries {
+      match self.open_node(id, flags) {
+        Err(EACCES) => {}
+        x => return x.map(Some),
+      }
+    }
+
+    Ok(None)
   }
 
   /// SETATTR by the node's name in its directory. A symlink's mode has no meaning, a file not
@@ -1157,6 +1255,8 @@ impl Server {
   fn readdir(&self, r: &Req, plus: bool) -> Res {
     let x: abi::ReadIn = arg(r.args, 0)?;
     let h = self.handle_fd(x.fh)?;
+    // Moved out of the share on the Mac while open, it is no longer the guest's to list.
+    self.path(h.node)?;
     let fd = h.fd.as_raw_fd();
     let mut list = h.list.lock().unwrap();
     // An offset is the index of the next entry, `.` and `..` first. The handle keeps only what
@@ -1240,32 +1340,29 @@ impl Server {
     // doesn't count.
     let full = size == 0 || name.is_none();
     let mut buf = vec![0u8; if full { MAX_XATTR } else { (size as usize).min(MAX_XATTR) }];
-    let n = self.in_dir(id, |file| {
+    let (ptr, len): (*mut libc::c_void, _) = (buf.as_mut_ptr().cast(), buf.len());
+    let done = |n: isize| match n {
+      n if n >= 0 => Ok(n as usize),
+      _ if full && os() == ERANGE => Err(E2BIG), // longer than Linux allows
+      _ => Err(os()),
+    };
+    let n = self.on_file(
+      id,
       // SAFETY: the calls write at most the buffer's size; the strings are NUL-terminated.
-      let n = unsafe {
-        match name {
-          Some(x) => libc::getxattr(
-            file.as_ptr(),
-            x.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-            libc::XATTR_NOFOLLOW,
-          ),
-          None => {
-            libc::listxattr(file.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), libc::XATTR_NOFOLLOW)
-          }
-        }
-      };
-      if n < 0 {
-        return Err(match os() {
-          ERANGE if full => E2BIG, // longer than Linux allows
-          x => x,
-        });
-      }
-
-      Ok(n as usize)
-    })?;
+      |fd| unsafe {
+        done(match name {
+          Some(x) => libc::fgetxattr(fd, x.as_ptr(), ptr, len, 0, 0),
+          None => libc::flistxattr(fd, ptr.cast(), len, 0),
+        })
+      },
+      // SAFETY: as for a descriptor.
+      |file| unsafe {
+        done(match name {
+          Some(x) => libc::getxattr(file.as_ptr(), x.as_ptr(), ptr, len, 0, libc::XATTR_NOFOLLOW),
+          None => libc::listxattr(file.as_ptr(), ptr.cast(), len, libc::XATTR_NOFOLLOW),
+        })
+      },
+    )?;
 
     buf.truncate(n);
     if name.is_none() {
@@ -1296,15 +1393,18 @@ impl Server {
     // Linux's XATTR_CREATE and XATTR_REPLACE are 1 and 2.
     let bits = [(1, libc::XATTR_CREATE), (2, libc::XATTR_REPLACE)];
     let opts = bits.into_iter().filter(|&(l, _)| x.flags & l != 0).fold(0, |f, (_, m)| f | m);
-    let opts = opts | libc::XATTR_NOFOLLOW;
-    self.in_dir(r.h.nodeid, |file| {
-      let (v, len) = (value.as_ptr().cast(), value.len());
+    let (v, len) = (value.as_ptr().cast(), value.len());
+    let done = |r: i32| if r == 0 { Ok(Out::Bytes(Vec::new())) } else { Err(os()) };
+    self.on_file(
+      r.h.nodeid,
       // SAFETY: NUL-terminated strings and a value of its length.
-      match unsafe { libc::setxattr(file.as_ptr(), name.as_ptr(), v, len, 0, opts) } {
-        0 => Ok(Out::Bytes(Vec::new())),
-        _ => Err(os()),
-      }
-    })
+      |fd| done(unsafe { libc::fsetxattr(fd, name.as_ptr(), v, len, 0, opts) }),
+      // SAFETY: as for a descriptor.
+      |file| {
+        let opts = opts | libc::XATTR_NOFOLLOW;
+        done(unsafe { libc::setxattr(file.as_ptr(), name.as_ptr(), v, len, 0, opts) })
+      },
+    )
   }
 }
 
@@ -1454,7 +1554,12 @@ unsafe extern "C" {
   /// libsystem_pthread, not in the SDK's headers: the calling thread's own working directory,
   /// the process's again for -1. macOS has no bindat().
   fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+  /// unistd.h: writes what the volume of `fd` holds in memory, as Linux's syncfs.
+  fn fsync_volume_np(fd: libc::c_int, flags: libc::c_int) -> libc::c_int;
 }
+
+/// unistd.h: fsync_volume_np waits for the writes it starts.
+const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
 
 /// A Unix socket's file, as bind() makes it: the guest's socket lives in the guest kernel, the
 /// file only marks the name. Bound by the name alone from this thread's working directory, so a
@@ -2287,8 +2392,6 @@ mod tests {
   fn permissions_are_the_owners() {
     use std::os::unix::fs::PermissionsExt;
 
-    const EACCES: i32 = 13;
-
     let mut t = T::new("perms");
     std::fs::create_dir(t.dir.join("d")).unwrap();
     std::fs::write(t.dir.join("d/f"), b"hi").unwrap();
@@ -2353,5 +2456,145 @@ mod tests {
     std::fs::remove_dir(t.dir.join("d")).unwrap();
     let n = t.s.changed(&path("d"), 0x200 | 0x20000);
     assert_eq!(abi::read::<abi::NotifyDeleteOut>(&n[0][16..]).unwrap().padding, abi::INVAL_DIR);
+  }
+
+  /// A folder's search permission counts at each lookup, also after a chmod on the Mac.
+  #[test]
+  fn folders_ask_search_permission_each_time() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut t = T::new("search");
+    let mode = |t: &T, x: &str, m| {
+      std::fs::set_permissions(t.dir.join(x), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    for x in ["d", "e"] {
+      std::fs::create_dir(t.dir.join(x)).unwrap();
+      std::fs::write(t.dir.join(x).join("f"), b"").unwrap();
+    }
+
+    let d = t.lookup(abi::ROOT_ID, "d").unwrap().nodeid;
+    t.lookup(d, "f").unwrap();
+    mode(&t, "d", 0o600);
+    assert_eq!(t.call(abi::UNLINK, d, &z("f"), 0).0, -EACCES);
+
+    // Searched but not read: looked in, then not once the search is taken away.
+    mode(&t, "e", 0o111);
+    let e = t.lookup(abi::ROOT_ID, "e").unwrap().nodeid;
+    assert!(t.lookup(e, "f").is_ok());
+    mode(&t, "e", 0o600);
+    assert_eq!(t.lookup(e, "f").unwrap_err(), EACCES);
+    mode(&t, "d", 0o755);
+    mode(&t, "e", 0o755);
+  }
+
+  /// SETATTR while the node's name is swapped with another file's: only the node's file changes.
+  #[test]
+  fn setattr_changes_only_its_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut t = T::new("setattr-race");
+    std::fs::write(t.dir.join("a"), b"").unwrap();
+    std::fs::write(t.dir.join("b"), b"").unwrap();
+    let a = t.lookup(abi::ROOT_ID, "a").unwrap().nodeid;
+    let b = std::fs::metadata(t.dir.join("b")).unwrap().ino();
+    let before = std::fs::metadata(t.dir.join("b")).unwrap().mode() & 0o7777;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swap = {
+      let (stop, dir) = (stop.clone(), t.dir.clone());
+      std::thread::spawn(move || {
+        let (x, y) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+        let d = std::fs::File::open(&dir).unwrap();
+        while !stop.load(Ordering::Relaxed) {
+          // SAFETY: NUL-terminated names in an open directory.
+          unsafe { libc::renameatx_np(d.as_raw_fd(), x.as_ptr(), d.as_raw_fd(), y.as_ptr(), 2) };
+        }
+      })
+    };
+
+    for i in 0..2000 {
+      let mode = if i % 2 == 0 { 0o600 } else { 0o640 };
+      let sa = abi::SetattrIn { valid: abi::FATTR_MODE, mode, ..Default::default() };
+      t.call(abi::SETATTR, a, abi::bytes(&sa), 256);
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    swap.join().unwrap();
+    let mode = ["a", "b"].into_iter().map(|x| std::fs::metadata(t.dir.join(x)).unwrap());
+    let mode = mode.filter(|x| x.ino() == b).map(|x| x.mode() & 0o7777).next();
+    assert_eq!(mode, Some(before));
+  }
+
+  /// A file made on the Mac and looked up before FSEvents tells of it is still news for its
+  /// directory, once; one the guest made is not.
+  #[test]
+  fn made_names_are_news_once() {
+    let mut t = T::new("news");
+    let root = t.dir.canonicalize().unwrap();
+    let path = |name: &str| root.join(name).as_os_str().as_bytes().to_vec();
+    let entries = |n: &[Vec<u8>]| {
+      let code = |x: &Vec<u8>| abi::read::<abi::OutHeader>(x).unwrap().error;
+      n.iter().filter(|x| code(x) == abi::NOTIFY_INVAL_ENTRY).count()
+    };
+
+    std::fs::write(t.dir.join("h"), b"").unwrap();
+    t.lookup(abi::ROOT_ID, "h").unwrap();
+    assert_eq!(entries(&t.s.changed(&path("h"), 0x100)), 1);
+    assert_eq!(entries(&t.s.changed(&path("h"), 0x1100)), 0);
+
+    let c = abi::CreateIn { flags: 0o102, mode: 0o100644, ..Default::default() }; // O_CREAT|O_RDWR
+    assert_eq!(t.call(abi::CREATE, abi::ROOT_ID, &cat(&[abi::bytes(&c), &z("g")]), 256).0, 0);
+    assert_eq!(entries(&t.s.changed(&path("g"), 0x100)), 0);
+    let m = abi::MkdirIn { mode: 0o755, umask: 0 };
+    assert_eq!(t.call(abi::MKDIR, abi::ROOT_ID, &cat(&[abi::bytes(&m), &z("d")]), 256).0, 0);
+    assert_eq!(entries(&t.s.changed(&path("d"), 0x100 | 0x20000)), 0);
+    assert_eq!(t.call(abi::SYNCFS, abi::ROOT_ID, &[0; 8], 0).0, 0);
+  }
+
+  /// A directory the guest has open and the Mac moves out of the share is not listed after.
+  #[test]
+  fn open_folders_moved_out_are_not_listed() {
+    let mut t = T::new("moved-open");
+    let out = outside(&t);
+    std::fs::create_dir(t.dir.join("d")).unwrap();
+    let d = t.lookup(abi::ROOT_ID, "d").unwrap().nodeid;
+    let fh = open_fh(&mut t, abi::OPENDIR, d, 0).unwrap();
+    std::fs::rename(t.dir.join("d"), out.join("d")).unwrap();
+    std::fs::write(out.join("d/new"), b"").unwrap();
+
+    let rd = abi::ReadIn { fh, size: 4096, ..Default::default() };
+    assert_eq!(t.call(abi::READDIRPLUS, d, abi::bytes(&rd), 4096).0, -ESTALE);
+    let _ = std::fs::remove_dir_all(&out);
+  }
+
+  /// A file removed while open keeps its extended attributes for the guest.
+  #[test]
+  fn open_files_keep_their_xattrs() {
+    let mut t = T::new("unlinked-xattr");
+    std::fs::write(t.dir.join("f"), b"").unwrap();
+    set_xattr(&t.dir.join("f"), c"user.k", b"value");
+    let f = t.lookup(abi::ROOT_ID, "f").unwrap().nodeid;
+    let fh = open_fh(&mut t, abi::OPEN, f, 2).unwrap();
+    assert_eq!(t.call(abi::UNLINK, abi::ROOT_ID, &z("f"), 0).0, 0);
+
+    let gx = abi::GetxattrIn { size: 64, padding: 0 };
+    let args = cat(&[abi::bytes(&gx), &z("user.k")]);
+    assert_eq!(t.call(abi::GETXATTR, f, &args, 64), (0, b"value".to_vec()));
+    let rl = abi::ReleaseIn { fh, ..Default::default() };
+    t.call(abi::RELEASE, f, abi::bytes(&rl), 0);
+  }
+
+  /// A WRITE longer than the guest's kernel sends writes no more than MAX_IO.
+  #[test]
+  fn writes_are_bounded() {
+    let mut t = T::new("write-size");
+    std::fs::write(t.dir.join("f"), b"").unwrap();
+    let f = t.lookup(abi::ROOT_ID, "f").unwrap().nodeid;
+    let fh = open_fh(&mut t, abi::OPEN, f, 2).unwrap();
+    let x = abi::WriteIn { fh, size: MAX_IO + 1, ..Default::default() };
+    let args = cat(&[abi::bytes(&x), &vec![b'X'; x.size as usize]]);
+    let (e, b) = t.call(abi::WRITE, f, &args, 16);
+    assert_eq!((e, abi::read::<abi::WriteOut>(&b).unwrap().size), (0, MAX_IO));
+    assert_eq!(std::fs::metadata(t.dir.join("f")).unwrap().len(), MAX_IO as u64);
   }
 }
