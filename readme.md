@@ -32,7 +32,7 @@ starts the VM.
 ```sh
 lodka start                        # all the Mac's CPUs, half its memory up to 8 GiB, 64 GiB disk
 lodka start --cpus 4 --memory 6    # sizes are kept for the next start
-export DOCKER_HOST=unix://$HOME/.local/state/lodka/docker.sock
+docker context use lodka           # the context lodka start adds
 docker run --rm -p 8080:80 nginx   # http://localhost:8080
 lodka ssh                          # a root shell in the VM; lodka ssh -- uname -a
 lodka status

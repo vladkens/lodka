@@ -5,6 +5,7 @@
 
 mod args;
 mod cli;
+mod context;
 mod dirs;
 mod ports;
 mod vm;

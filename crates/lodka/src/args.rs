@@ -20,9 +20,10 @@ usage:
                     stop the VM and delete its disk, with all images and volumes
   lodka version
 
-Docker's socket is in `lodka status`: point DOCKER_HOST at it. Files, by the XDG Base Directory
-spec: settings in ~/.config/lodka/lodka.conf (XDG_CONFIG_HOME), the disk and SSH key in
-~/.local/share/lodka (XDG_DATA_HOME), logs and sockets in ~/.local/state/lodka (XDG_STATE_HOME).";
+Docker: `docker context use lodka`, a context `lodka start` adds, or DOCKER_HOST at the socket
+`lodka status` shows. Files, by the XDG Base Directory spec: settings in
+~/.config/lodka/lodka.conf (XDG_CONFIG_HOME), the disk and SSH key in ~/.local/share/lodka
+(XDG_DATA_HOME), logs and sockets in ~/.local/state/lodka (XDG_STATE_HOME).";
 
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
